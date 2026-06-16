@@ -34,6 +34,8 @@ pub struct App {
     filter_t_end: String,
     /// Fractional cadence tolerance for DBC-derived health rules (e.g. 0.3 = ±30%).
     health_tolerance: f64,
+    /// Channels selected in the Analysis-tab filter; empty = all channels.
+    channel_filter: BTreeSet<u8>,
     // --- Config tab state --------------------------------------------------
     /// Last load error (log or DBC), shown in the Config tab; `None` = no error.
     config_error: Option<String>,
@@ -54,6 +56,7 @@ impl App {
             filter_t_start: String::new(),
             filter_t_end: String::new(),
             health_tolerance: 0.3,
+            channel_filter: BTreeSet::new(),
             config_error: None,
         }
     }
@@ -73,6 +76,7 @@ impl eframe::App for App {
             filter_t_start,
             filter_t_end,
             health_tolerance,
+            channel_filter,
             config_error,
         } = self;
 
@@ -94,6 +98,7 @@ impl eframe::App for App {
                 filter_t_start,
                 filter_t_end,
                 health_tolerance,
+                channel_filter,
             ),
             Tab::Graph => graph_tab(ctx, session, signals, selected, *t_start, *t_end),
         }
@@ -122,11 +127,12 @@ fn config_tab(
                     .add_filter("CAN log", &["blf", "asc"])
                     .pick_file()
                 {
-                    match session.load_log(&path) {
-                        Ok(()) => {
+                    // Additive: keep already-loaded logs and append this one.
+                    match session.add_log(&path) {
+                        Ok(_id) => {
                             // Reflect the new log in every tab: refresh the signal
                             // list (DBC unchanged but recomputed for consistency)
-                            // and reset the plot window to the full duration.
+                            // and extend the plot window to the full duration.
                             *signals = session.available_signals();
                             *t_end = session.duration();
                             *config_error = None;
@@ -140,8 +146,9 @@ fn config_tab(
                     .add_filter("DBC", &["dbc"])
                     .pick_file()
                 {
-                    match session.load_dbc(&path) {
-                        Ok(()) => {
+                    // Additive: append this DBC (all channels) alongside existing ones.
+                    match session.add_dbc(&path, None) {
+                        Ok(_id) => {
                             *signals = session.available_signals();
                             *config_error = None;
                         }
@@ -171,13 +178,111 @@ fn config_tab(
                 ui.label("Signals");
                 ui.monospace(signals.len().to_string());
                 ui.end_row();
-
-                ui.label("DBC loaded");
-                // No DBC ⇒ no decodable signals; the heuristic is good enough here.
-                ui.monospace(if signals.is_empty() { "no" } else { "yes" });
-                ui.end_row();
             });
+
+        // --- Loaded logs -------------------------------------------------
+        ui.separator();
+        ui.strong("Loaded logs");
+        // Collect ids to remove after the row loop so we don't borrow `session`
+        // immutably (list_logs) and mutably (remove_log) at the same time.
+        let logs = session.list_logs();
+        if logs.is_empty() {
+            ui.label("No logs loaded.");
+        }
+        let mut log_to_remove: Option<u32> = None;
+        for log in &logs {
+            ui.horizontal(|ui| {
+                if ui.button("✕").on_hover_text("Remove this log").clicked() {
+                    log_to_remove = Some(log.id);
+                }
+                ui.monospace(basename(&log.path)).on_hover_text(&log.path);
+                ui.label(format!("{} frames", log.frame_count));
+                ui.label(format!("ch {}", channels_label(&log.channels)));
+            });
+        }
+        if let Some(id) = log_to_remove {
+            session.remove_log(id);
+            *signals = session.available_signals();
+            *t_end = session.duration();
+        }
+
+        // --- Loaded DBCs -------------------------------------------------
+        ui.separator();
+        ui.strong("Loaded DBCs");
+        let dbcs = session.list_dbcs();
+        if dbcs.is_empty() {
+            ui.label("No DBCs loaded.");
+        }
+        let all_channels = session.channels();
+        let mut dbc_to_remove: Option<u32> = None;
+        // Channel reassignment to apply after the loop (avoids aliasing borrows).
+        let mut dbc_set_channel: Option<(u32, Option<u8>)> = None;
+        for dbc in &dbcs {
+            ui.horizontal(|ui| {
+                if ui.button("✕").on_hover_text("Remove this DBC").clicked() {
+                    dbc_to_remove = Some(dbc.id);
+                }
+                ui.monospace(basename(&dbc.path)).on_hover_text(&dbc.path);
+                ui.label(format!(
+                    "{} msgs / {} sigs",
+                    dbc.message_count, dbc.signal_count
+                ));
+
+                // Channel selector: "All" + each distinct log channel.
+                let current = match dbc.channel {
+                    None => "All".to_string(),
+                    Some(ch) => format!("ch {ch}"),
+                };
+                ui.label("channel:");
+                egui::ComboBox::from_id_salt(("dbc_channel", dbc.id))
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(dbc.channel.is_none(), "All")
+                            .clicked()
+                            && dbc.channel.is_some()
+                        {
+                            dbc_set_channel = Some((dbc.id, None));
+                        }
+                        for &ch in &all_channels {
+                            if ui
+                                .selectable_label(dbc.channel == Some(ch), format!("ch {ch}"))
+                                .clicked()
+                                && dbc.channel != Some(ch)
+                            {
+                                dbc_set_channel = Some((dbc.id, Some(ch)));
+                            }
+                        }
+                    });
+            });
+        }
+        if let Some((id, ch)) = dbc_set_channel {
+            session.set_dbc_channel(id, ch);
+            *signals = session.available_signals();
+        }
+        if let Some(id) = dbc_to_remove {
+            session.remove_dbc(id);
+            *signals = session.available_signals();
+        }
     });
+}
+
+/// Last path component (basename); falls back to the whole string.
+fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or(path)
+}
+
+/// Compact channel list label, e.g. `1,2` (or `-` when empty).
+fn channels_label(channels: &[u8]) -> String {
+    if channels.is_empty() {
+        "-".to_string()
+    } else {
+        channels
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// Analysis tab — filterable virtualized frame table plus per-id cycle stats.
@@ -188,6 +293,7 @@ fn analysis_tab(
     filter_t_start: &mut String,
     filter_t_end: &mut String,
     health_tolerance: &mut f64,
+    channel_filter: &mut BTreeSet<u8>,
 ) {
     // Build a FrameFilter from the (lenient) text inputs. Unparseable fields are
     // simply treated as "no constraint", so a default filter matches all rows.
@@ -197,8 +303,13 @@ fn analysis_tab(
     }
     filter.t_start = filter_t_start.trim().parse::<f64>().ok();
     filter.t_end = filter_t_end.trim().parse::<f64>().ok();
+    // Selected channels (empty = all). Feeds the core FrameFilter's channel field.
+    filter.channels = channel_filter.iter().copied().collect();
 
-    let active = !filter.can_ids.is_empty() || filter.t_start.is_some() || filter.t_end.is_some();
+    let active = !filter.can_ids.is_empty()
+        || filter.t_start.is_some()
+        || filter.t_end.is_some()
+        || !filter.channels.is_empty();
 
     // --- Cycle stats (bottom strip) ----------------------------------------
     egui::TopBottomPanel::bottom("cycle_stats")
@@ -261,6 +372,26 @@ fn analysis_tab(
             ui.label("t ≤");
             ui.add(egui::TextEdit::singleline(filter_t_end).desired_width(64.0));
         });
+
+        // Channel ON/OFF filter (none checked = all channels). Only mutates App
+        // state (`channel_filter`); the selection is read back into `filter`
+        // above on the next frame.
+        let channels = session.channels();
+        if !channels.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("Channels:");
+                for ch in channels {
+                    let mut on = channel_filter.contains(&ch);
+                    if ui.checkbox(&mut on, format!("ch {ch}")).changed() {
+                        if on {
+                            channel_filter.insert(ch);
+                        } else {
+                            channel_filter.remove(&ch);
+                        }
+                    }
+                }
+            });
+        }
         ui.separator();
 
         // Drive the count/window off the filter; fall back to all rows when no
