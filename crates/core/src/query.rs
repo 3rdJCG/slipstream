@@ -112,6 +112,20 @@ pub struct SignalStats {
     pub mean: f64,
 }
 
+/// Per-message-id cycle-time statistics: how regularly frames sharing a CAN id
+/// arrive. `dt` is the inter-arrival time (seconds) between consecutive frames
+/// of that id (frames are time-ordered). `jitter` is `max_dt - min_dt`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CycleStats {
+    pub can_id: u32,
+    /// Number of inter-arrival intervals (one fewer than the frame count).
+    pub count: u64,
+    pub mean_dt: f64,
+    pub min_dt: f64,
+    pub max_dt: f64,
+    pub jitter: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Session — owns loaded state, answers queries
 // ---------------------------------------------------------------------------
@@ -266,6 +280,54 @@ impl Session {
             max,
             mean: sum / count as f64,
         })
+    }
+
+    /// Cycle-time statistics for a single CAN id, or `None` if fewer than two
+    /// frames carry that id (no inter-arrival interval to measure).
+    pub fn cycle_stats(&self, can_id: u32) -> Option<CycleStats> {
+        let cols = self.store.columns();
+        let mut prev: Option<f64> = None;
+        let mut count = 0u64;
+        let mut sum = 0.0;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for i in 0..cols.len() {
+            if cols.can_id[i] != can_id {
+                continue;
+            }
+            let t = cols.timestamp[i];
+            if let Some(p) = prev {
+                let dt = t - p;
+                count += 1;
+                sum += dt;
+                min = min.min(dt);
+                max = max.max(dt);
+            }
+            prev = Some(t);
+        }
+        if count == 0 {
+            return None;
+        }
+        Some(CycleStats {
+            can_id,
+            count,
+            mean_dt: sum / count as f64,
+            min_dt: min,
+            max_dt: max,
+            jitter: max - min,
+        })
+    }
+
+    /// Cycle-time statistics for every distinct CAN id present, sorted ascending
+    /// by `can_id`. Ids with fewer than two frames are omitted.
+    pub fn all_cycle_stats(&self) -> Vec<CycleStats> {
+        let cols = self.store.columns();
+        let mut ids: Vec<u32> = cols.can_id.clone();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .filter_map(|id| self.cycle_stats(id))
+            .collect()
     }
 
     /// Decode a signal's `(timestamp, value)` series from the columnar frames
@@ -424,6 +486,37 @@ mod tests {
         };
         let count = s.filtered_count(&f);
         assert!(count > 0 && count < s.frame_count(), "count {count}");
+    }
+
+    #[test]
+    fn cycle_stats_demo_regular_grid() {
+        let s = Session::demo();
+        // 0x100 is emitted n=5000 times over 60s on a regular grid, so the
+        // inter-arrival time is ~60/5000 = 0.012 s with negligible jitter.
+        let cs = s.cycle_stats(0x100).expect("0x100 cycle stats");
+        assert_eq!(cs.can_id, 0x100);
+        assert_eq!(cs.count, 4999); // one fewer interval than frames
+        let expected = 60.0 / 5000.0;
+        assert!((cs.mean_dt - expected).abs() < 1e-9, "mean_dt {}", cs.mean_dt);
+        assert!(cs.jitter < 1e-6, "jitter {}", cs.jitter);
+        assert!((cs.max_dt - cs.min_dt - cs.jitter).abs() < 1e-12);
+
+        // Unknown id has no frames at all.
+        assert!(s.cycle_stats(0x999).is_none());
+    }
+
+    #[test]
+    fn all_cycle_stats_sorted_by_id() {
+        let s = Session::demo();
+        let all = s.all_cycle_stats();
+        assert_eq!(all.len(), 2, "two distinct ids");
+        assert_eq!(all[0].can_id, 0x100);
+        assert_eq!(all[1].can_id, 0x200);
+        let expected = 60.0 / 5000.0;
+        for cs in &all {
+            assert!((cs.mean_dt - expected).abs() < 1e-9, "mean_dt {}", cs.mean_dt);
+            assert!(cs.jitter < 1e-6, "jitter {}", cs.jitter);
+        }
     }
 
     #[test]
