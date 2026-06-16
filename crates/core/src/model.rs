@@ -50,6 +50,33 @@ impl FrameColumns {
         self.dlc.push(n as u8);
         self.data.push(data);
     }
+
+    /// Append all rows of `other` (used to combine multiple loaded logs).
+    pub fn append(&mut self, other: &FrameColumns) {
+        self.timestamp.extend_from_slice(&other.timestamp);
+        self.channel.extend_from_slice(&other.channel);
+        self.can_id.extend_from_slice(&other.can_id);
+        self.is_fd.extend_from_slice(&other.is_fd);
+        self.dlc.extend_from_slice(&other.dlc);
+        self.data.extend_from_slice(&other.data);
+    }
+
+    /// Stable-sort all columns by timestamp (used after merging logs whose time
+    /// bases interleave). Single-log ingest is already time-ordered.
+    pub fn sort_by_timestamp(&mut self) {
+        let mut idx: Vec<usize> = (0..self.len()).collect();
+        idx.sort_by(|&a, &b| {
+            self.timestamp[a]
+                .partial_cmp(&self.timestamp[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.timestamp = idx.iter().map(|&i| self.timestamp[i]).collect();
+        self.channel = idx.iter().map(|&i| self.channel[i]).collect();
+        self.can_id = idx.iter().map(|&i| self.can_id[i]).collect();
+        self.is_fd = idx.iter().map(|&i| self.is_fd[i]).collect();
+        self.dlc = idx.iter().map(|&i| self.dlc[i]).collect();
+        self.data = idx.iter().map(|&i| self.data[i]).collect();
+    }
 }
 
 /// One raw frame, materialized for a table row window (serde wire type).
@@ -82,4 +109,6 @@ pub struct SignalMeta {
     pub can_id: u32,
     pub message: String,
     pub unit: String,
+    /// Channel the owning DBC is scoped to (`None` = all channels).
+    pub channel: Option<u8>,
 }

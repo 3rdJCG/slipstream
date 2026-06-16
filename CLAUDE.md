@@ -80,6 +80,18 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [ ] シグナル同定を `Message.Signal` で修飾（同名衝突を回避。`find_signal(name)` のグローバル名引きを置換）
 - [x] Config タブでのロード/設定変更を Analysis/Graph に即時反映する経路
 
+### P1 — ロード済みファイル管理 / チャンネル操作
+複数の LOG / DBC を同時にロードし、一覧表示・個別削除できるようにする。チャンネル
+（bus）を意識した運用にする。
+- [x] core: `Session` を複数 LOG 保持に（`logs: Vec<LoadedLog>`、`add_log`/`remove_log`/`list_logs`）。全 LOG を結合した派生ストアを再構築（既存クエリは結合ストアをそのまま読む。複数時は timestamp 昇順マージ）
+- [x] core: 複数 DBC 保持（`dbcs: Vec<LoadedDbc{ path, channel: Option<u8>, db }>`、`add_dbc`/`remove_dbc`/`set_dbc_channel`/`list_dbcs`）。`channel=None` は全チャンネル適用
+- [x] core: **チャンネル別デコード** — フレームは「その channel に割り当てられた（or 全体）DBC」でデコード。`available_signals`/`signal_series` を channel 対応に（`SignalMeta` に channel 付与、`find_signal` は全 DBC 横断）
+- [x] core: チャンネル一覧 `Session::channels()`（全 LOG distinct channel）。※ channel 別フレーム数は今後
+- [ ] gui(Config): ロード済み **LOG 一覧**（path / frames / channels）+ 個別削除ボタン、追加は既存 Open log を addtive に
+- [ ] gui(Config): ロード済み **DBC 一覧**（path / messages / 割り当て channel）+ 個別削除 + channel 割り当て（All / 特定 ch）の編集
+- [ ] gui: チャンネル別操作（channel の表示 ON/OFF フィルタ、channel→DBC 割り当て UI）
+- [ ] 旧 `load_log`/`load_dbc`（置き換え型）は addtive 版へ移行（互換のため当面 clear+add で温存可）
+
 ### P1 — シグナル述語エンジン（検索・フィルタ・ゲート共通）
 値の閾値・比較を時間軸上で評価する述語型を `core` に1つ用意し、検索/フィルタ・
 健全性のゲート条件・統計区間の指定で再利用する（バラバラに作らない）。

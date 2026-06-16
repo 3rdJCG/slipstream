@@ -137,10 +137,53 @@ pub struct CycleStats {
 // Session — owns loaded state, answers queries
 // ---------------------------------------------------------------------------
 
+/// One loaded log file: source path, parsed frames, and the distinct channels
+/// it contains.
+struct LoadedLog {
+    id: u32,
+    path: std::path::PathBuf,
+    frames: FrameColumns,
+    channels: Vec<u8>,
+}
+
+/// One loaded DBC, optionally scoped to a single channel (`None` = all channels).
+struct LoadedDbc {
+    id: u32,
+    /// `None` for the synthetic demo DBC.
+    path: Option<std::path::PathBuf>,
+    channel: Option<u8>,
+    db: DbcDatabase,
+}
+
+/// Serde-friendly summary of a loaded log (drives the Config-tab file list).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogInfo {
+    pub id: u32,
+    pub path: String,
+    pub frame_count: u64,
+    pub channels: Vec<u8>,
+}
+
+/// Serde-friendly summary of a loaded DBC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbcInfo {
+    pub id: u32,
+    pub path: String,
+    /// Channel this DBC applies to (`None` = all channels).
+    pub channel: Option<u8>,
+    pub message_count: usize,
+    pub signal_count: usize,
+}
+
 pub struct Session {
+    logs: Vec<LoadedLog>,
+    dbcs: Vec<LoadedDbc>,
+    /// Monotonic id allocator for logs/dbcs.
+    next_id: u32,
+    /// Combined, time-ordered view of all loaded logs — rebuilt on add/remove so
+    /// every query method can keep reading a single store, oblivious to multi-log.
     store: FrameStore,
-    dbc: DbcDatabase,
-    /// Total time span of the loaded log, seconds.
+    /// Total time span of the combined logs, seconds.
     duration: f64,
 }
 
@@ -172,52 +215,200 @@ impl Session {
             frames.push(t, 1, 0x200, false, &p200);
         }
 
-        Self {
-            store: FrameStore::new(frames),
-            dbc: demo_dbc(),
-            duration,
-        }
+        let channels = frames_channels(&frames);
+        let log = LoadedLog {
+            id: 0,
+            path: std::path::PathBuf::from("<demo>"),
+            frames,
+            channels,
+        };
+        let dbc = LoadedDbc {
+            id: 1,
+            path: None,
+            channel: None,
+            db: demo_dbc(),
+        };
+        Self::from_parts(vec![log], vec![dbc], 2)
     }
 
     /// Open and ingest a real BLF/ASC log. Signals stay empty until a DBC is
     /// loaded (P1); the frame table works immediately.
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        let frames = crate::ingest::parse(path)?;
-        let duration = frames.timestamp.last().copied().unwrap_or(0.0);
-        Ok(Self {
-            store: FrameStore::new(frames),
-            dbc: DbcDatabase::default(),
-            duration,
-        })
+        let mut session = Self::from_parts(Vec::new(), Vec::new(), 0);
+        session.add_log(path)?;
+        Ok(session)
     }
 
     /// Open a log and load a DBC, so signals are immediately decodable/plottable.
     pub fn open_with_dbc(log: &std::path::Path, dbc: &std::path::Path) -> Result<Self> {
         let mut session = Self::open(log)?;
-        session.dbc = DbcDatabase::load(dbc)?;
+        session.add_dbc(dbc, None)?;
         Ok(session)
     }
 
-    /// Replace this session's DBC (e.g. loaded later from the Config tab).
-    /// `available_signals` reads the DBC live, so callers see the new signals
-    /// immediately — nothing to invalidate.
-    pub fn set_dbc(&mut self, dbc: DbcDatabase) {
-        self.dbc = dbc;
+    /// Construct from explicit parts and build the combined store.
+    fn from_parts(logs: Vec<LoadedLog>, dbcs: Vec<LoadedDbc>, next_id: u32) -> Self {
+        let mut s = Self {
+            logs,
+            dbcs,
+            next_id,
+            store: FrameStore::new(FrameColumns::default()),
+            duration: 0.0,
+        };
+        s.rebuild_store();
+        s
     }
 
-    /// Load a `.dbc` file and set it as this session's DBC, replacing any
-    /// existing one.
+    fn alloc_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Rebuild the combined store from all loaded logs (concatenate; sort by
+    /// timestamp when more than one log is loaded) and recompute duration.
+    fn rebuild_store(&mut self) {
+        let mut combined = FrameColumns::default();
+        for log in &self.logs {
+            combined.append(&log.frames);
+        }
+        if self.logs.len() > 1 {
+            combined.sort_by_timestamp();
+        }
+        self.duration = combined.timestamp.last().copied().unwrap_or(0.0);
+        self.store = FrameStore::new(combined);
+    }
+
+    // --- loaded-file management (multiple logs / dbcs) ---------------------
+
+    /// Add a log file (additive). Returns its id.
+    pub fn add_log(&mut self, path: &std::path::Path) -> Result<u32> {
+        let frames = crate::ingest::parse(path)?;
+        let channels = frames_channels(&frames);
+        let id = self.alloc_id();
+        self.logs.push(LoadedLog {
+            id,
+            path: path.to_path_buf(),
+            frames,
+            channels,
+        });
+        self.rebuild_store();
+        Ok(id)
+    }
+
+    /// Remove a loaded log by id; rebuilds the combined store. Returns whether
+    /// a log was removed.
+    pub fn remove_log(&mut self, id: u32) -> bool {
+        let before = self.logs.len();
+        self.logs.retain(|l| l.id != id);
+        let removed = self.logs.len() != before;
+        if removed {
+            self.rebuild_store();
+        }
+        removed
+    }
+
+    pub fn list_logs(&self) -> Vec<LogInfo> {
+        self.logs
+            .iter()
+            .map(|l| LogInfo {
+                id: l.id,
+                path: l.path.display().to_string(),
+                frame_count: l.frames.len() as u64,
+                channels: l.channels.clone(),
+            })
+            .collect()
+    }
+
+    /// Add a DBC scoped to `channel` (`None` = all channels). Returns its id.
+    pub fn add_dbc(&mut self, path: &std::path::Path, channel: Option<u8>) -> Result<u32> {
+        let db = DbcDatabase::load(path)?;
+        let id = self.alloc_id();
+        self.dbcs.push(LoadedDbc {
+            id,
+            path: Some(path.to_path_buf()),
+            channel,
+            db,
+        });
+        Ok(id)
+    }
+
+    /// Remove a loaded DBC by id. Returns whether one was removed.
+    pub fn remove_dbc(&mut self, id: u32) -> bool {
+        let before = self.dbcs.len();
+        self.dbcs.retain(|d| d.id != id);
+        self.dbcs.len() != before
+    }
+
+    /// Change the channel a loaded DBC applies to. Returns whether it was found.
+    pub fn set_dbc_channel(&mut self, id: u32, channel: Option<u8>) -> bool {
+        if let Some(d) = self.dbcs.iter_mut().find(|d| d.id == id) {
+            d.channel = channel;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn list_dbcs(&self) -> Vec<DbcInfo> {
+        self.dbcs
+            .iter()
+            .map(|d| DbcInfo {
+                id: d.id,
+                path: d
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<demo>".to_string()),
+                channel: d.channel,
+                message_count: d.db.messages.len(),
+                signal_count: d.db.messages.iter().map(|m| m.signals.len()).sum(),
+            })
+            .collect()
+    }
+
+    /// Distinct channels across all loaded logs (sorted ascending).
+    pub fn channels(&self) -> Vec<u8> {
+        let mut chs: Vec<u8> = self
+            .logs
+            .iter()
+            .flat_map(|l| l.channels.iter().copied())
+            .collect();
+        chs.sort_unstable();
+        chs.dedup();
+        chs
+    }
+
+    // --- compat: replace-style loaders (older callers / tests) -------------
+
+    /// Replace all DBCs with `dbc` (channel = all).
+    pub fn set_dbc(&mut self, dbc: DbcDatabase) {
+        let id = self.alloc_id();
+        self.dbcs = vec![LoadedDbc {
+            id,
+            path: None,
+            channel: None,
+            db: dbc,
+        }];
+    }
+
+    /// Replace all DBCs with the one at `path` (channel = all).
     pub fn load_dbc(&mut self, path: &std::path::Path) -> Result<()> {
-        self.dbc = DbcDatabase::load(path)?;
+        let db = DbcDatabase::load(path)?;
+        let id = self.alloc_id();
+        self.dbcs = vec![LoadedDbc {
+            id,
+            path: Some(path.to_path_buf()),
+            channel: None,
+            db,
+        }];
         Ok(())
     }
 
-    /// Re-ingest a BLF/ASC log into this session: replace the frame store and
-    /// recompute the duration. The DBC is kept as-is.
+    /// Replace all logs with the one at `path` (keeps DBCs).
     pub fn load_log(&mut self, path: &std::path::Path) -> Result<()> {
-        let frames = crate::ingest::parse(path)?;
-        self.duration = frames.timestamp.last().copied().unwrap_or(0.0);
-        self.store = FrameStore::new(frames);
+        self.logs.clear();
+        self.add_log(path)?;
         Ok(())
     }
 
@@ -229,9 +420,24 @@ impl Session {
         self.store.len() as u64
     }
 
-    /// Signals available to plot (drives the signal tree).
+    /// Signals available to plot, aggregated across all DBCs and annotated with
+    /// the channel each DBC applies to.
     pub fn available_signals(&self) -> Vec<SignalMeta> {
-        self.dbc.signal_metas()
+        let mut out = Vec::new();
+        for d in &self.dbcs {
+            for m in &d.db.messages {
+                for s in &m.signals {
+                    out.push(SignalMeta {
+                        name: s.name.clone(),
+                        can_id: m.can_id,
+                        message: m.name.clone(),
+                        unit: s.unit.clone(),
+                        channel: d.channel,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Decimate one signal to the requested pixel width (min/max per bucket).
@@ -375,9 +581,9 @@ impl Session {
     pub fn dbc_health_rules(&self, tolerance: f64) -> crate::health::HealthRuleSet {
         use crate::health::HealthRule;
         let rules = self
-            .dbc
-            .messages
+            .dbcs
             .iter()
+            .flat_map(|d| d.db.messages.iter())
             .filter_map(|m| {
                 m.expected_cycle_ms.map(|ms| HealthRule {
                     can_id: m.can_id,
@@ -501,8 +707,7 @@ impl Session {
     /// via the DBC. Gathers all frames for the signal's `can_id` and decodes
     /// each payload (the column-at-a-time decode path).
     fn signal_series(&self, name: &str) -> Result<Vec<(f64, f64)>> {
-        let (can_id, sig) = self
-            .dbc
+        let (can_id, sig, channel) = self
             .find_signal(name)
             .ok_or_else(|| Error::UnknownSignal(name.to_string()))?;
         let cols = self.store.columns();
@@ -511,12 +716,29 @@ impl Session {
             if cols.can_id[i] != can_id {
                 continue;
             }
+            // Honor the owning DBC's channel scope (None = any channel).
+            if let Some(ch) = channel {
+                if cols.channel[i] != ch {
+                    continue;
+                }
+            }
             let dlc = cols.dlc[i] as usize;
             if let Some(v) = crate::dbc::decode_signal(sig, &cols.data[i][..dlc]) {
                 out.push((cols.timestamp[i], v));
             }
         }
         Ok(out)
+    }
+
+    /// Find a signal by name across all loaded DBCs (first match), returning its
+    /// frame id, definition, and the owning DBC's channel scope.
+    fn find_signal(&self, name: &str) -> Option<(u32, &crate::dbc::SignalDef, Option<u8>)> {
+        for d in &self.dbcs {
+            if let Some((can_id, sig)) = d.db.find_signal(name) {
+                return Some((can_id, sig, d.channel));
+            }
+        }
+        None
     }
 }
 
@@ -547,6 +769,14 @@ fn min_max_decimate(points: &[(f64, f64)], t0: f64, t1: f64, px_width: u32) -> V
         .flatten()
         .map(|(t, v_min, v_max)| PlotBin { t, v_min, v_max })
         .collect()
+}
+
+/// Distinct channels present in a frame set (sorted ascending).
+fn frames_channels(frames: &FrameColumns) -> Vec<u8> {
+    let mut chs = frames.channel.clone();
+    chs.sort_unstable();
+    chs.dedup();
+    chs
 }
 
 fn demo_dbc() -> DbcDatabase {
@@ -876,5 +1106,66 @@ mod tests {
         let signals = s.available_signals();
         assert!(!signals.is_empty());
         assert!(signals.iter().any(|m| m.name == "Rpm"));
+    }
+
+    #[test]
+    fn multi_log_add_list_remove() {
+        let dir = std::env::temp_dir();
+        let p1 = dir.join("slipstream_multi1.asc");
+        let p2 = dir.join("slipstream_multi2.asc");
+        std::fs::write(&p1, "0.0 1 100 Rx d 1 11\n0.1 1 100 Rx d 1 22\n").unwrap();
+        std::fs::write(&p2, "0.0 2 200 Rx d 1 33\n").unwrap();
+
+        let mut s = Session::open(&p1).unwrap();
+        assert_eq!(s.list_logs().len(), 1);
+        assert_eq!(s.channels(), vec![1]);
+
+        let id2 = s.add_log(&p2).unwrap();
+        assert_eq!(s.list_logs().len(), 2);
+        assert_eq!(s.frame_count(), 3); // 2 + 1, combined
+        assert_eq!(s.channels(), vec![1, 2]);
+
+        assert!(s.remove_log(id2));
+        assert_eq!(s.list_logs().len(), 1);
+        assert_eq!(s.frame_count(), 2);
+        assert_eq!(s.channels(), vec![1]);
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn multi_dbc_list_set_channel_remove() {
+        let path = std::env::temp_dir().join("slipstream_extra.dbc");
+        std::fs::write(
+            &path,
+            "VERSION \"\"\n\nBO_ 777 Extra: 8 ECU\n SG_ Foo : 0|8@1+ (1,0) [0|0] \"\" Vector__XXX\n",
+        )
+        .unwrap();
+
+        let mut s = Session::demo();
+        let base = s.list_dbcs().len(); // demo DBC
+        let id = s.add_dbc(&path, Some(2)).unwrap();
+
+        let dbcs = s.list_dbcs();
+        assert_eq!(dbcs.len(), base + 1);
+        let added = dbcs.iter().find(|d| d.id == id).unwrap();
+        assert_eq!(added.channel, Some(2));
+        assert!(added.signal_count >= 1);
+        assert!(s
+            .available_signals()
+            .iter()
+            .any(|m| m.name == "Foo" && m.channel == Some(2)));
+
+        assert!(s.set_dbc_channel(id, None));
+        assert!(s
+            .available_signals()
+            .iter()
+            .any(|m| m.name == "Foo" && m.channel.is_none()));
+
+        assert!(s.remove_dbc(id));
+        assert_eq!(s.list_dbcs().len(), base);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

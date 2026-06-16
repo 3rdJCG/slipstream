@@ -99,6 +99,7 @@ impl DbcDatabase {
                     can_id: m.can_id,
                     message: m.name.clone(),
                     unit: s.unit.clone(),
+                    channel: None,
                 })
             })
             .collect()
