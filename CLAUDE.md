@@ -53,6 +53,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [x] フォーマット判定 + `Session::open(path)`
 - [x] gui-egui でファイルを開く CLI 引数（デモへのフォールバック）
 - [x] ラウンドトリップのインジェストテスト（writer → ingest）
+- [ ] **ASC を自前の tolerant パーサに置換** — `blf_asc` の ASC reader は実ログの `Statistic:` / `Status:` / `J1939TP` / 名前付き `CANFD` / `ErrorFrame` 行で hard error し、以後の行を全部失う（`samples/logfile.asc` で確認）。フレーム行以外はスキップして読み続ける自前パーサにする。BLF は `blf_asc` のままで実ファイル検証OK
 - [ ] BLF コンテナの解凍を並列化（rayon）— *最適化。ベンチマークには実際のマルチGBサンプルが必要*
 - [ ] 初回インジェスト時の Parquet（または列指向）キャッシュ → 再オープンを即時化
 - [ ] 非常に大きなファイル向けの mmap ベース読み込み
@@ -142,3 +143,8 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - `blf_asc` はシングルスレッドのイテレータ（コンテナを逐次 inflate）。正しく動作し、
   旧 Python よりはるかに高速だが、上記の並列解凍の最適化が「マルチGB を数秒で」への
   道筋となる。最適化の前に、実際の Vector `.blf` サンプルで検証すること。
+- 実サンプル検証（`python-can` テストデータ、`samples/` に取得・gitignore）:
+  BLF は CAN/CAN_MESSAGE2/CAN-FD/FD64 すべて正しくパース。ASC は `blf_asc` が
+  実 `logfile.asc`（Statistic/Status/J1939TP/名前付きCANFD 行）で hard error →
+  上記 P0「ASC 自前パーサ」で対応。ヘッドレス検証ツール: `cargo run -p slipstream-core
+  --example dump -- <log> [N]`。
