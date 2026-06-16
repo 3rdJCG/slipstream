@@ -330,6 +330,80 @@ impl Session {
             .collect()
     }
 
+    /// Build default health rules from the DBC's `GenMsgCycleTime` attributes
+    /// (one rule per message that declares a cycle time), with a shared
+    /// `tolerance`. Manual rules can be added on top.
+    pub fn dbc_health_rules(&self, tolerance: f64) -> crate::health::HealthRuleSet {
+        use crate::health::{Gate, HealthRule};
+        let rules = self
+            .dbc
+            .messages
+            .iter()
+            .filter_map(|m| {
+                m.expected_cycle_ms.map(|ms| HealthRule {
+                    can_id: m.can_id,
+                    name: m.name.clone(),
+                    expected_dt: ms / 1000.0,
+                    tolerance,
+                    gate: Gate::Always,
+                })
+            })
+            .collect();
+        crate::health::HealthRuleSet { rules }
+    }
+
+    /// Run frame-health checks for every rule, returning all cadence violations
+    /// (an id with fewer than two frames inside its gate yields a single
+    /// `NoData` violation).
+    pub fn check_health(
+        &self,
+        rules: &crate::health::HealthRuleSet,
+    ) -> Vec<crate::health::Violation> {
+        use crate::health::{scan_cadence, Violation, ViolationKind};
+        let cols = self.store.columns();
+        let mut out = Vec::new();
+        for rule in &rules.rules {
+            let gate = self.build_gate(&rule.gate);
+            let mut times = Vec::new();
+            for i in 0..cols.len() {
+                if cols.can_id[i] == rule.can_id && gate.is_active(cols.timestamp[i]) {
+                    times.push(cols.timestamp[i]);
+                }
+            }
+            if times.len() < 2 {
+                out.push(Violation {
+                    can_id: rule.can_id,
+                    kind: ViolationKind::NoData,
+                    t_start: 0.0,
+                    t_end: self.duration,
+                    observed_dt: 0.0,
+                    expected_dt: rule.expected_dt,
+                });
+                continue;
+            }
+            out.extend(scan_cadence(rule.can_id, &times, rule.expected_dt, rule.tolerance));
+        }
+        out
+    }
+
+    /// Precompute a gate evaluator (decodes the gate signal once when needed).
+    fn build_gate(&self, gate: &crate::health::Gate) -> GateEval {
+        use crate::health::Gate;
+        match gate {
+            Gate::Always => GateEval::Always,
+            Gate::TimeRange { t_start, t_end } => GateEval::Range(*t_start, *t_end),
+            Gate::Signal { signal, op, value } => {
+                let samples = self
+                    .signal_series(signal)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(t, v)| (t, op.eval(v, *value)))
+                    .collect();
+                GateEval::Signal(samples)
+            }
+        }
+    }
+
     /// Decode a signal's `(timestamp, value)` series from the columnar frames
     /// via the DBC. Gathers all frames for the signal's `can_id` and decodes
     /// each payload (the column-at-a-time decode path).
@@ -350,6 +424,28 @@ impl Session {
             }
         }
         Ok(out)
+    }
+}
+
+/// Precomputed gate activity used by [`Session::check_health`]. Signal samples
+/// are `(timestamp, active?)` sorted by time; the value is held forward and is
+/// inactive before the first sample.
+enum GateEval {
+    Always,
+    Range(f64, f64),
+    Signal(Vec<(f64, bool)>),
+}
+
+impl GateEval {
+    fn is_active(&self, t: f64) -> bool {
+        match self {
+            GateEval::Always => true,
+            GateEval::Range(a, b) => t >= *a && t <= *b,
+            GateEval::Signal(samples) => {
+                let idx = samples.partition_point(|(st, _)| *st <= t);
+                idx > 0 && samples[idx - 1].1
+            }
+        }
     }
 }
 
@@ -406,6 +502,8 @@ fn demo_dbc() -> DbcDatabase {
                     sig("EngineSpeed", 0, 16, 0.25, 0.0, "rpm"),
                     sig("CoolantTemp", 16, 8, 1.0, -40.0, "degC"),
                 ],
+                // Demo emits 5000 frames over 60 s ⇒ 12 ms cadence.
+                expected_cycle_ms: Some(12.0),
             },
             DbcMessage {
                 can_id: 0x200,
@@ -414,6 +512,7 @@ fn demo_dbc() -> DbcDatabase {
                     sig("VehicleSpeed", 0, 16, 0.01, 0.0, "km/h"),
                     sig("Gear", 16, 4, 1.0, 0.0, ""),
                 ],
+                expected_cycle_ms: Some(12.0),
             },
         ],
     }
@@ -523,5 +622,71 @@ mod tests {
     fn default_filter_matches_all() {
         let s = Session::demo();
         assert_eq!(s.filtered_count(&FrameFilter::default()), s.frame_count());
+    }
+
+    #[test]
+    fn health_demo_regular_is_clean() {
+        use crate::health::{Gate, HealthRule, HealthRuleSet};
+        let s = Session::demo();
+        let set = HealthRuleSet {
+            rules: vec![HealthRule {
+                can_id: 0x100,
+                name: "EngineData".into(),
+                expected_dt: 0.012,
+                tolerance: 0.5,
+                gate: Gate::Always,
+            }],
+        };
+        assert!(s.check_health(&set).is_empty());
+    }
+
+    #[test]
+    fn health_missing_id_is_nodata() {
+        use crate::health::{Gate, HealthRule, HealthRuleSet, ViolationKind};
+        let s = Session::demo();
+        let set = HealthRuleSet {
+            rules: vec![HealthRule {
+                can_id: 0x999,
+                name: "Absent".into(),
+                expected_dt: 0.01,
+                tolerance: 0.2,
+                gate: Gate::Always,
+            }],
+        };
+        let v = s.check_health(&set);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ViolationKind::NoData);
+    }
+
+    #[test]
+    fn dbc_health_rules_built_from_cycle_time() {
+        let s = Session::demo();
+        let set = s.dbc_health_rules(0.3);
+        assert_eq!(set.rules.len(), 2); // both demo messages declare 12 ms
+        assert!(set.rules.iter().all(|r| (r.expected_dt - 0.012).abs() < 1e-9));
+        // The DBC-derived rules pass on the regular demo log.
+        assert!(s.check_health(&set).is_empty());
+    }
+
+    #[test]
+    fn health_time_range_gate_excludes_frames() {
+        use crate::health::{Gate, HealthRule, HealthRuleSet, ViolationKind};
+        let s = Session::demo();
+        // Gate to an empty window ⇒ no frames considered ⇒ NoData.
+        let set = HealthRuleSet {
+            rules: vec![HealthRule {
+                can_id: 0x100,
+                name: "EngineData".into(),
+                expected_dt: 0.012,
+                tolerance: 0.5,
+                gate: Gate::TimeRange {
+                    t_start: 1000.0,
+                    t_end: 2000.0,
+                },
+            }],
+        };
+        let v = s.check_health(&set);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ViolationKind::NoData);
     }
 }

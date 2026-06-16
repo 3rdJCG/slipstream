@@ -38,6 +38,9 @@ pub struct DbcMessage {
     pub can_id: u32,
     pub name: String,
     pub signals: Vec<SignalDef>,
+    /// Expected cycle time in milliseconds, from the `GenMsgCycleTime`
+    /// attribute, if the DBC declares one.
+    pub expected_cycle_ms: Option<f64>,
 }
 
 impl DbcDatabase {
@@ -51,14 +54,36 @@ impl DbcDatabase {
     pub fn parse(text: &str) -> Result<Self> {
         let dbc = can_dbc::Dbc::try_from(text)
             .map_err(|e| Error::Parse(format!("DBC parse failed: {e:?}")))?;
+
+        // Collect GenMsgCycleTime (ms) per message id, if present.
+        let mut cycle_ms: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+        for av in &dbc.attribute_values_message {
+            if av.name != "GenMsgCycleTime" {
+                continue;
+            }
+            let ms = match av.value {
+                can_dbc::AttributeValue::Uint(u) => u as f64,
+                can_dbc::AttributeValue::Int(i) => i as f64,
+                can_dbc::AttributeValue::Double(d) => d,
+                can_dbc::AttributeValue::String(_) => continue,
+            };
+            if ms > 0.0 {
+                cycle_ms.insert(av.message_id.raw() & 0x1FFF_FFFF, ms);
+            }
+        }
+
         let messages = dbc
             .messages
             .iter()
-            .map(|m| DbcMessage {
+            .map(|m| {
                 // Strip the extended-id flag; frame ids from ingest are 29-bit.
-                can_id: m.id.raw() & 0x1FFF_FFFF,
-                name: m.name.clone(),
-                signals: m.signals.iter().map(map_signal).collect(),
+                let can_id = m.id.raw() & 0x1FFF_FFFF;
+                DbcMessage {
+                    can_id,
+                    name: m.name.clone(),
+                    signals: m.signals.iter().map(map_signal).collect(),
+                    expected_cycle_ms: cycle_ms.get(&can_id).copied(),
+                }
             })
             .collect();
         Ok(Self { messages })
