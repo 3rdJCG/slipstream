@@ -102,8 +102,8 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [ ] ゲート信号のチャタリング対策（ヒステリシス / デバウンス）
 - [ ] ログ端のグレース（最初の出現前・最後の出現後は欠落と見なさない）
 - [ ] DBC・手動ルールいずれにも該当しない ID を「未知フレーム」として一覧
-- [ ] 結果スキーマ：RPC 形式の `HealthReport` 型（違反フレーム・違反区間・周期統計）を定義
-- [ ] チェック結果を Analysis タブに表示（違反一覧 + 違反区間。行テーブルと連動）
+- [x] 結果スキーマ：RPC 形式の `HealthReport` 型（違反フレーム・違反区間・周期統計）を定義
+- [x] チェック結果を Analysis タブに表示（違反一覧 + 違反区間。行テーブルと連動）
 - [x] 健全性ルールセットの保存 / 読み込み（core: `health::HealthRuleSet::save/load`、JSON。手動ルール + ゲートを 1 セットで永続化）
       - メモ: ゲートは述語エンジン（`predicate::Predicate`、AND/OR/Not 対応）に統合済み。ヒステリシス・`(can_id,channel)` 粒度・`HealthReport` 型・ゲート構築 UI は上記未チェック項目で対応予定
 

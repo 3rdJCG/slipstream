@@ -32,6 +32,8 @@ pub struct App {
     /// Inclusive time-range bounds as text; empty = open bound.
     filter_t_start: String,
     filter_t_end: String,
+    /// Fractional cadence tolerance for DBC-derived health rules (e.g. 0.3 = ±30%).
+    health_tolerance: f64,
     // --- Config tab state --------------------------------------------------
     /// Last load error (log or DBC), shown in the Config tab; `None` = no error.
     config_error: Option<String>,
@@ -51,6 +53,7 @@ impl App {
             filter_id: String::new(),
             filter_t_start: String::new(),
             filter_t_end: String::new(),
+            health_tolerance: 0.3,
             config_error: None,
         }
     }
@@ -69,6 +72,7 @@ impl eframe::App for App {
             filter_id,
             filter_t_start,
             filter_t_end,
+            health_tolerance,
             config_error,
         } = self;
 
@@ -83,9 +87,14 @@ impl eframe::App for App {
 
         match tab {
             Tab::Config => config_tab(ctx, session, signals, t_end, config_error),
-            Tab::Analysis => {
-                analysis_tab(ctx, session, filter_id, filter_t_start, filter_t_end)
-            }
+            Tab::Analysis => analysis_tab(
+                ctx,
+                session,
+                filter_id,
+                filter_t_start,
+                filter_t_end,
+                health_tolerance,
+            ),
             Tab::Graph => graph_tab(ctx, session, signals, selected, *t_start, *t_end),
         }
     }
@@ -178,6 +187,7 @@ fn analysis_tab(
     filter_id: &mut String,
     filter_t_start: &mut String,
     filter_t_end: &mut String,
+    health_tolerance: &mut f64,
 ) {
     // Build a FrameFilter from the (lenient) text inputs. Unparseable fields are
     // simply treated as "no constraint", so a default filter matches all rows.
@@ -317,7 +327,156 @@ fn analysis_tab(
                     }
                 });
             });
+
+        ui.separator();
+        health_section(ui, session, health_tolerance);
     });
+}
+
+/// Maximum number of violation rows the violations table will display, to keep
+/// the per-frame rebuild cheap even when a log has very many violations.
+const HEALTH_VIOLATION_LIMIT: usize = 500;
+
+/// Frame-health section of the Analysis tab (collapsing). Thin view: it derives
+/// rules from the DBC via [`Session::dbc_health_rules`] and runs
+/// [`Session::health_report`] each frame (cheap enough for the demo), then shows
+/// a per-rule summary plus a (capped) list of individual violations.
+fn health_section(ui: &mut egui::Ui, session: &Session, health_tolerance: &mut f64) {
+    egui::CollapsingHeader::new("Health (frame cadence)")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Tolerance (±):");
+                ui.add(
+                    egui::Slider::new(health_tolerance, 0.0..=1.0)
+                        .fixed_decimals(2)
+                        .clamping(egui::SliderClamping::Always),
+                );
+            });
+
+            // Derive cadence rules from the DBC and run the report. Building +
+            // running each frame is fine for the demo; revisit if it gets heavy.
+            let rules = session.dbc_health_rules(*health_tolerance);
+            if rules.rules.is_empty() {
+                ui.label("Load a DBC in Config to derive cycle rules.");
+                return;
+            }
+            let report = session.health_report(&rules);
+
+            ui.horizontal(|ui| {
+                ui.label(format!("rules: {}", report.rules.len()));
+                ui.separator();
+                ui.label(format!("total violations: {}", report.total_violations));
+                ui.separator();
+                ui.label(if report.all_ok { "all ok ✓" } else { "violations ✗" });
+            });
+
+            // --- Per-rule summary table ------------------------------------
+            ui.add_space(4.0);
+            ui.strong("Rules");
+            TableBuilder::new(ui)
+                .id_salt("health_rule_table")
+                .striped(true)
+                .resizable(true)
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::remainder())
+                .header(20.0, |mut header| {
+                    for h in ["id", "name", "expected_dt", "ok", "missing", "excessive", "no_data"]
+                    {
+                        header.col(|ui| {
+                            ui.strong(h);
+                        });
+                    }
+                })
+                .body(|mut body| {
+                    for rr in &report.rules {
+                        body.row(18.0, |mut row| {
+                            row.col(|ui| {
+                                ui.monospace(format!("0x{:X}", rr.can_id));
+                            });
+                            row.col(|ui| {
+                                ui.monospace(&rr.name);
+                            });
+                            row.col(|ui| {
+                                ui.monospace(format!("{:.6}", rr.expected_dt));
+                            });
+                            row.col(|ui| {
+                                ui.monospace(if rr.ok { "✓" } else { "✗" });
+                            });
+                            row.col(|ui| {
+                                ui.monospace(rr.missing.to_string());
+                            });
+                            row.col(|ui| {
+                                ui.monospace(rr.excessive.to_string());
+                            });
+                            row.col(|ui| {
+                                ui.monospace(if rr.no_data { "✗" } else { "—" });
+                            });
+                        });
+                    }
+                });
+
+            // --- Violations table (capped) ---------------------------------
+            ui.add_space(8.0);
+            ui.strong("Violations");
+            // Flatten the per-rule violations into one ordered list, then cap it.
+            let all: Vec<&slipstream_core::health::Violation> =
+                report.rules.iter().flat_map(|rr| rr.violations.iter()).collect();
+            let shown = all.len().min(HEALTH_VIOLATION_LIMIT);
+            if all.len() > HEALTH_VIOLATION_LIMIT {
+                ui.label(format!(
+                    "showing first {shown} of {} violations (truncated)",
+                    all.len()
+                ));
+            } else {
+                ui.label(format!("{} violations", all.len()));
+            }
+            TableBuilder::new(ui)
+                .id_salt("health_violation_table")
+                .striped(true)
+                .resizable(true)
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::remainder())
+                .header(20.0, |mut header| {
+                    for h in ["id", "kind", "t_start", "t_end", "observed_dt", "expected_dt"] {
+                        header.col(|ui| {
+                            ui.strong(h);
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(18.0, shown, |mut row| {
+                        let v = all[row.index()];
+                        row.col(|ui| {
+                            ui.monospace(format!("0x{:X}", v.can_id));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("{:?}", v.kind));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("{:.4}", v.t_start));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("{:.4}", v.t_end));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("{:.6}", v.observed_dt));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("{:.6}", v.expected_dt));
+                        });
+                    });
+                });
+        });
 }
 
 /// Graph tab — signal tree, decimated plot, and a per-signal stats strip.

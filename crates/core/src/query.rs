@@ -398,31 +398,78 @@ impl Session {
         &self,
         rules: &crate::health::HealthRuleSet,
     ) -> Vec<crate::health::Violation> {
-        use crate::health::{scan_cadence, Violation, ViolationKind};
-        let cols = self.store.columns();
-        let mut out = Vec::new();
+        rules
+            .rules
+            .iter()
+            .flat_map(|rule| self.check_rule(rule))
+            .collect()
+    }
+
+    /// RPC-shaped health report: one [`RuleReport`] per rule (with per-kind
+    /// counts) plus rolled-up aggregates. Reuses the same per-rule check as
+    /// [`Session::check_health`].
+    pub fn health_report(
+        &self,
+        rules: &crate::health::HealthRuleSet,
+    ) -> crate::health::HealthReport {
+        use crate::health::{HealthReport, RuleReport, ViolationKind};
+        let mut reports = Vec::with_capacity(rules.rules.len());
+        let mut total_violations = 0u64;
         for rule in &rules.rules {
-            let gate = self.build_pred(&rule.gate);
-            let mut times = Vec::new();
-            for i in 0..cols.len() {
-                if cols.can_id[i] == rule.can_id && gate.is_active(cols.timestamp[i]) {
-                    times.push(cols.timestamp[i]);
+            let violations = self.check_rule(rule);
+            let mut missing = 0u64;
+            let mut excessive = 0u64;
+            let mut no_data = false;
+            for v in &violations {
+                match v.kind {
+                    ViolationKind::Missing => missing += 1,
+                    ViolationKind::Excessive => excessive += 1,
+                    ViolationKind::NoData => no_data = true,
                 }
             }
-            if times.len() < 2 {
-                out.push(Violation {
-                    can_id: rule.can_id,
-                    kind: ViolationKind::NoData,
-                    t_start: 0.0,
-                    t_end: self.duration,
-                    observed_dt: 0.0,
-                    expected_dt: rule.expected_dt,
-                });
-                continue;
-            }
-            out.extend(scan_cadence(rule.can_id, &times, rule.expected_dt, rule.tolerance));
+            total_violations += violations.len() as u64;
+            reports.push(RuleReport {
+                can_id: rule.can_id,
+                name: rule.name.clone(),
+                expected_dt: rule.expected_dt,
+                ok: violations.is_empty(),
+                missing,
+                excessive,
+                no_data,
+                violations,
+            });
         }
-        out
+        HealthReport {
+            all_ok: total_violations == 0,
+            total_violations,
+            rules: reports,
+        }
+    }
+
+    /// Check a single rule, returning its cadence violations (fewer than two
+    /// gated frames yields a single `NoData` violation). Shared by
+    /// [`Session::check_health`] and [`Session::health_report`].
+    fn check_rule(&self, rule: &crate::health::HealthRule) -> Vec<crate::health::Violation> {
+        use crate::health::{scan_cadence, Violation, ViolationKind};
+        let cols = self.store.columns();
+        let gate = self.build_pred(&rule.gate);
+        let mut times = Vec::new();
+        for i in 0..cols.len() {
+            if cols.can_id[i] == rule.can_id && gate.is_active(cols.timestamp[i]) {
+                times.push(cols.timestamp[i]);
+            }
+        }
+        if times.len() < 2 {
+            return vec![Violation {
+                can_id: rule.can_id,
+                kind: ViolationKind::NoData,
+                t_start: 0.0,
+                t_end: self.duration,
+                observed_dt: 0.0,
+                expected_dt: rule.expected_dt,
+            }];
+        }
+        scan_cadence(rule.can_id, &times, rule.expected_dt, rule.tolerance)
     }
 
     /// Precompute a predicate evaluator, decoding any referenced signals once.
@@ -712,6 +759,47 @@ mod tests {
         let v = s.check_health(&set);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ViolationKind::NoData);
+    }
+
+    #[test]
+    fn health_report_demo_dbc_rules_all_ok() {
+        let s = Session::demo();
+        let report = s.health_report(&s.dbc_health_rules(0.5));
+        assert!(report.all_ok);
+        assert_eq!(report.total_violations, 0);
+        assert_eq!(report.rules.len(), 2); // both demo messages declare a cycle
+        assert!(report.rules.iter().all(|r| r.ok && !r.no_data));
+        assert!(report
+            .rules
+            .iter()
+            .all(|r| r.missing == 0 && r.excessive == 0 && r.violations.is_empty()));
+    }
+
+    #[test]
+    fn health_report_tiny_expected_dt_flags_missing() {
+        use crate::health::{HealthRule, HealthRuleSet};
+        let s = Session::demo();
+        // An unrealistically small expected cadence makes every real gap look
+        // like a missing frame.
+        let set = HealthRuleSet {
+            rules: vec![HealthRule {
+                can_id: 0x100,
+                name: "EngineData".into(),
+                expected_dt: 0.0001,
+                tolerance: 0.5,
+                gate: Predicate::Always,
+            }],
+        };
+        let report = s.health_report(&set);
+        assert!(!report.all_ok);
+        assert!(report.total_violations > 0);
+        assert_eq!(report.rules.len(), 1);
+        let r = &report.rules[0];
+        assert!(!r.ok);
+        assert!(r.missing > 0, "missing {}", r.missing);
+        assert!(!r.no_data);
+        // total_violations matches the summed per-rule violations.
+        assert_eq!(report.total_violations, r.violations.len() as u64);
     }
 
     #[test]

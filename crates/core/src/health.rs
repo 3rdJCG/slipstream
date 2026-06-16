@@ -56,6 +56,35 @@ pub struct HealthRuleSet {
     pub rules: Vec<HealthRule>,
 }
 
+/// Per-rule outcome of a health check: the rule's identity, whether it passed,
+/// counts by violation kind, and the violations themselves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleReport {
+    pub can_id: u32,
+    pub name: String,
+    pub expected_dt: f64,
+    /// `true` when this rule produced no violations.
+    pub ok: bool,
+    /// Number of [`ViolationKind::Missing`] violations.
+    pub missing: u64,
+    /// Number of [`ViolationKind::Excessive`] violations.
+    pub excessive: u64,
+    /// `true` if a [`ViolationKind::NoData`] violation is present.
+    pub no_data: bool,
+    pub violations: Vec<Violation>,
+}
+
+/// RPC-shaped result of running a [`HealthRuleSet`]: one [`RuleReport`] per rule
+/// plus rolled-up aggregates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthReport {
+    pub rules: Vec<RuleReport>,
+    /// Total number of violations across all rules.
+    pub total_violations: u64,
+    /// `true` when every rule passed (no violations anywhere).
+    pub all_ok: bool,
+}
+
 impl HealthRuleSet {
     /// Save as pretty JSON.
     pub fn save(&self, path: &Path) -> Result<()> {
