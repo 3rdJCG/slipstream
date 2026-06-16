@@ -82,10 +82,10 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 ### P1 — シグナル述語エンジン（検索・フィルタ・ゲート共通）
 値の閾値・比較を時間軸上で評価する述語型を `core` に1つ用意し、検索/フィルタ・
 健全性のゲート条件・統計区間の指定で再利用する（バラバラに作らない）。
-- [ ] 時間軸シグナル述語型（`Signal 比較 値`、ON/OFF など）を `core` に定義
-- [ ] **複数条件を AND/OR で組み合わせ**可能にする
-- [ ] `FrameFilter`（id/channel/time）を拡張し、この述語で signal 値フィルタを実現
-- [ ] 同じ述語を健全性のゲート条件・統計の対象区間指定にも使う
+- [x] 時間軸シグナル述語型（`Signal 比較 値`）を `core` に定義（`predicate::Predicate` + `PredEval::is_active(t)`、値はサンプル間で前方保持）
+- [x] **複数条件を AND/OR で組み合わせ**可能にする（`Predicate::All`/`Any`/`Not`）
+- [x] `FrameFilter`（id/channel/time）を拡張し、この述語で signal 値フィルタを実現（`FrameFilter.predicate`、`matching_indices` で評価）
+- [x] 同じ述語を健全性のゲート条件に使う（`HealthRule.gate: Predicate`、`build_pred` 共用）。統計の対象区間指定への適用は今後
 
 ### P1 — フレーム健全性（周期/存在チェック）
 フレームが想定どおりに来ているかを検査する。判定は**フレーム単位（存在・周期）**で、
@@ -105,7 +105,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [ ] 結果スキーマ：RPC 形式の `HealthReport` 型（違反フレーム・違反区間・周期統計）を定義
 - [ ] チェック結果を Analysis タブに表示（違反一覧 + 違反区間。行テーブルと連動）
 - [x] 健全性ルールセットの保存 / 読み込み（core: `health::HealthRuleSet::save/load`、JSON。手動ルール + ゲートを 1 セットで永続化）
-      - メモ: core ゲートは単純版 `Gate{Always/Signal/TimeRange}` を実装済み。AND/OR 合成・ヒステリシス・`(can_id,channel)` 粒度・`HealthReport` 型は上記未チェック項目で対応予定（述語エンジン導入時に再編）
+      - メモ: ゲートは述語エンジン（`predicate::Predicate`、AND/OR/Not 対応）に統合済み。ヒステリシス・`(can_id,channel)` 粒度・`HealthReport` 型・ゲート構築 UI は上記未チェック項目で対応予定
 
 ### P1 — 画面構成（タブ UI シェル）
 タブで画面を切り替える構成にする。各タブは同一の `core::Session` を共有し、タブ

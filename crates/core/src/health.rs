@@ -10,56 +10,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::predicate::Predicate;
 use crate::{Error, Result};
 
-/// Comparison operator for a signal-value gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Compare {
-    Eq,
-    Ne,
-    Gt,
-    Ge,
-    Lt,
-    Le,
-}
-
-impl Compare {
-    pub fn eval(self, a: f64, b: f64) -> bool {
-        match self {
-            Compare::Eq => a == b,
-            Compare::Ne => a != b,
-            Compare::Gt => a > b,
-            Compare::Ge => a >= b,
-            Compare::Lt => a < b,
-            Compare::Le => a <= b,
-        }
-    }
-}
-
-/// Restricts *when* a health rule is evaluated. A frame is only considered if
-/// the gate is active at its timestamp.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Gate {
-    /// Always active (no gating).
-    Always,
-    /// Active while a decoded signal satisfies `op value` (value held between
-    /// samples; inactive before the first sample).
-    Signal {
-        signal: String,
-        op: Compare,
-        value: f64,
-    },
-    /// Active within an explicit inclusive time window (seconds).
-    TimeRange { t_start: f64, t_end: f64 },
-}
-
-impl Default for Gate {
-    fn default() -> Self {
-        Gate::Always
-    }
-}
-
-/// Expected cadence of one CAN id, optionally gated.
+/// Expected cadence of one CAN id, optionally gated by a [`Predicate`] (e.g.
+/// "ignition ON"). The rule is only evaluated where its gate is active.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthRule {
     pub can_id: u32,
@@ -69,9 +24,9 @@ pub struct HealthRule {
     pub expected_dt: f64,
     /// Fractional tolerance, e.g. 0.2 = ±20%.
     pub tolerance: f64,
-    /// When to apply the rule. Defaults to [`Gate::Always`].
+    /// When to apply the rule. Defaults to [`Predicate::Always`].
     #[serde(default)]
-    pub gate: Gate,
+    pub gate: Predicate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,9 +142,9 @@ mod tests {
                 name: "EngineData".into(),
                 expected_dt: 0.01,
                 tolerance: 0.2,
-                gate: Gate::Signal {
+                gate: Predicate::Signal {
                     signal: "Ignition".into(),
-                    op: Compare::Ge,
+                    op: crate::predicate::Compare::Ge,
                     value: 1.0,
                 },
             }],

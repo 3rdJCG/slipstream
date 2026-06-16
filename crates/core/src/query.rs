@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dbc::DbcDatabase;
 use crate::model::{FrameColumns, FrameRow, SignalMeta};
+use crate::predicate::{PredEval, Predicate};
 use crate::store::FrameStore;
 use crate::{Error, Result};
 
@@ -70,10 +71,16 @@ pub struct FrameFilter {
     pub t_start: Option<f64>,
     /// Inclusive upper time bound, seconds (`None` = open).
     pub t_end: Option<f64>,
+    /// Optional signal-value predicate (`None` = no constraint). Evaluated at
+    /// each frame's timestamp; needs decoded signals, so it is applied in
+    /// `Session::matching_indices`, not in the per-row `matches`.
+    #[serde(default)]
+    pub predicate: Option<Predicate>,
 }
 
 impl FrameFilter {
-    /// Does row `i` of `cols` satisfy this filter?
+    /// Does row `i` satisfy the cheap per-row constraints (id/channel/time)?
+    /// The signal `predicate` is applied separately (it needs decoded signals).
     fn matches(&self, cols: &FrameColumns, i: usize) -> bool {
         if !self.can_ids.is_empty() && !self.can_ids.contains(&cols.can_id[i]) {
             return false;
@@ -271,11 +278,20 @@ impl Session {
         }
     }
 
-    /// Row indices (into the full store) matching `filter`. O(n) scan; a future
-    /// optimization is to cache this per filter (see CLAUDE.md).
+    /// Row indices (into the full store) matching `filter`, including its
+    /// optional signal predicate. O(n) scan; a future optimization is to cache
+    /// this per filter (see CLAUDE.md).
     fn matching_indices(&self, filter: &FrameFilter) -> Vec<usize> {
         let cols = self.store.columns();
-        (0..cols.len()).filter(|&i| filter.matches(cols, i)).collect()
+        let pred = filter.predicate.as_ref().map(|p| self.build_pred(p));
+        (0..cols.len())
+            .filter(|&i| {
+                filter.matches(cols, i)
+                    && pred
+                        .as_ref()
+                        .map_or(true, |e| e.is_active(cols.timestamp[i]))
+            })
+            .collect()
     }
 
     /// Summary statistics for a signal over a time window.
@@ -357,7 +373,7 @@ impl Session {
     /// (one rule per message that declares a cycle time), with a shared
     /// `tolerance`. Manual rules can be added on top.
     pub fn dbc_health_rules(&self, tolerance: f64) -> crate::health::HealthRuleSet {
-        use crate::health::{Gate, HealthRule};
+        use crate::health::HealthRule;
         let rules = self
             .dbc
             .messages
@@ -368,7 +384,7 @@ impl Session {
                     name: m.name.clone(),
                     expected_dt: ms / 1000.0,
                     tolerance,
-                    gate: Gate::Always,
+                    gate: Predicate::Always,
                 })
             })
             .collect();
@@ -386,7 +402,7 @@ impl Session {
         let cols = self.store.columns();
         let mut out = Vec::new();
         for rule in &rules.rules {
-            let gate = self.build_gate(&rule.gate);
+            let gate = self.build_pred(&rule.gate);
             let mut times = Vec::new();
             for i in 0..cols.len() {
                 if cols.can_id[i] == rule.can_id && gate.is_active(cols.timestamp[i]) {
@@ -409,21 +425,28 @@ impl Session {
         out
     }
 
-    /// Precompute a gate evaluator (decodes the gate signal once when needed).
-    fn build_gate(&self, gate: &crate::health::Gate) -> GateEval {
-        use crate::health::Gate;
-        match gate {
-            Gate::Always => GateEval::Always,
-            Gate::TimeRange { t_start, t_end } => GateEval::Range(*t_start, *t_end),
-            Gate::Signal { signal, op, value } => {
+    /// Precompute a predicate evaluator, decoding any referenced signals once.
+    /// Shared by health gates and signal-value frame filtering.
+    fn build_pred(&self, pred: &Predicate) -> PredEval {
+        match pred {
+            Predicate::Always => PredEval::Always,
+            Predicate::TimeRange { t_start, t_end } => PredEval::Range(*t_start, *t_end),
+            Predicate::Signal { signal, op, value } => {
                 let samples = self
                     .signal_series(signal)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|(t, v)| (t, op.eval(v, *value)))
                     .collect();
-                GateEval::Signal(samples)
+                PredEval::Signal(samples)
             }
+            Predicate::All(children) => {
+                PredEval::All(children.iter().map(|c| self.build_pred(c)).collect())
+            }
+            Predicate::Any(children) => {
+                PredEval::Any(children.iter().map(|c| self.build_pred(c)).collect())
+            }
+            Predicate::Not(child) => PredEval::Not(Box::new(self.build_pred(child))),
         }
     }
 
@@ -447,28 +470,6 @@ impl Session {
             }
         }
         Ok(out)
-    }
-}
-
-/// Precomputed gate activity used by [`Session::check_health`]. Signal samples
-/// are `(timestamp, active?)` sorted by time; the value is held forward and is
-/// inactive before the first sample.
-enum GateEval {
-    Always,
-    Range(f64, f64),
-    Signal(Vec<(f64, bool)>),
-}
-
-impl GateEval {
-    fn is_active(&self, t: f64) -> bool {
-        match self {
-            GateEval::Always => true,
-            GateEval::Range(a, b) => t >= *a && t <= *b,
-            GateEval::Signal(samples) => {
-                let idx = samples.partition_point(|(st, _)| *st <= t);
-                idx > 0 && samples[idx - 1].1
-            }
-        }
     }
 }
 
@@ -649,7 +650,7 @@ mod tests {
 
     #[test]
     fn health_demo_regular_is_clean() {
-        use crate::health::{Gate, HealthRule, HealthRuleSet};
+        use crate::health::{HealthRule, HealthRuleSet};
         let s = Session::demo();
         let set = HealthRuleSet {
             rules: vec![HealthRule {
@@ -657,7 +658,7 @@ mod tests {
                 name: "EngineData".into(),
                 expected_dt: 0.012,
                 tolerance: 0.5,
-                gate: Gate::Always,
+                gate: Predicate::Always,
             }],
         };
         assert!(s.check_health(&set).is_empty());
@@ -665,7 +666,7 @@ mod tests {
 
     #[test]
     fn health_missing_id_is_nodata() {
-        use crate::health::{Gate, HealthRule, HealthRuleSet, ViolationKind};
+        use crate::health::{HealthRule, HealthRuleSet, ViolationKind};
         let s = Session::demo();
         let set = HealthRuleSet {
             rules: vec![HealthRule {
@@ -673,7 +674,7 @@ mod tests {
                 name: "Absent".into(),
                 expected_dt: 0.01,
                 tolerance: 0.2,
-                gate: Gate::Always,
+                gate: Predicate::Always,
             }],
         };
         let v = s.check_health(&set);
@@ -693,7 +694,7 @@ mod tests {
 
     #[test]
     fn health_time_range_gate_excludes_frames() {
-        use crate::health::{Gate, HealthRule, HealthRuleSet, ViolationKind};
+        use crate::health::{HealthRule, HealthRuleSet, ViolationKind};
         let s = Session::demo();
         // Gate to an empty window ⇒ no frames considered ⇒ NoData.
         let set = HealthRuleSet {
@@ -702,9 +703,52 @@ mod tests {
                 name: "EngineData".into(),
                 expected_dt: 0.012,
                 tolerance: 0.5,
-                gate: Gate::TimeRange {
+                gate: Predicate::TimeRange {
                     t_start: 1000.0,
                     t_end: 2000.0,
+                },
+            }],
+        };
+        let v = s.check_health(&set);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ViolationKind::NoData);
+    }
+
+    #[test]
+    fn filter_by_signal_predicate() {
+        use crate::predicate::{Compare, Predicate};
+        let s = Session::demo();
+        // Keep 0x100 frames only while EngineSpeed (peaks ~5200 rpm) ≥ 5000.
+        let f = FrameFilter {
+            can_ids: vec![0x100],
+            predicate: Some(Predicate::Signal {
+                signal: "EngineSpeed".into(),
+                op: Compare::Ge,
+                value: 5000.0,
+            }),
+            ..Default::default()
+        };
+        let count = s.filtered_count(&f);
+        let all_100 = s.frame_count() / 2;
+        assert!(count > 0 && count < all_100, "count {count} of {all_100}");
+    }
+
+    #[test]
+    fn health_signal_gate_never_active_is_nodata() {
+        use crate::health::{HealthRule, HealthRuleSet, ViolationKind};
+        use crate::predicate::{Compare, Predicate};
+        let s = Session::demo();
+        // Gate that never holds ⇒ no frames considered ⇒ NoData.
+        let set = HealthRuleSet {
+            rules: vec![HealthRule {
+                can_id: 0x100,
+                name: "EngineData".into(),
+                expected_dt: 0.012,
+                tolerance: 0.5,
+                gate: Predicate::Signal {
+                    signal: "EngineSpeed".into(),
+                    op: Compare::Gt,
+                    value: 1e9,
                 },
             }],
         };
