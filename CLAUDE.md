@@ -19,7 +19,7 @@
 
 ```
 crates/core/      slipstream-core — ヘッドレスなエンジン（GUI 依存なし）
-  ingest/         BLF + ASC パース（現状は `blf_asc` crate 経由） -> FrameColumns
+  ingest/         BLF パース（`blf_asc` crate 経由）+ ASC パース（自前 tolerant パーサ） -> FrameColumns
   store           列指向ストア（SoA） + 行ウィンドウ + （計画中）Parquet キャッシュ
   dbc             DBC データベース + ベクトル化シグナルデコード
   query           ビュー駆動のクエリ API（Session）: decimate / rows / stats / diff
@@ -53,7 +53,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [x] フォーマット判定 + `Session::open(path)`
 - [x] gui-egui でファイルを開く CLI 引数（デモへのフォールバック）
 - [x] ラウンドトリップのインジェストテスト（writer → ingest）
-- [ ] **ASC を自前の tolerant パーサに置換** — `blf_asc` の ASC reader は実ログの `Statistic:` / `Status:` / `J1939TP` / 名前付き `CANFD` / `ErrorFrame` 行で hard error し、以後の行を全部失う（`samples/logfile.asc` で確認）。フレーム行以外はスキップして読み続ける自前パーサにする。BLF は `blf_asc` のままで実ファイル検証OK
+- [x] **ASC を自前の tolerant パーサに置換** — `blf_asc` の ASC reader は実ログの `Statistic:` / `Status:` / `J1939TP` / 名前付き `CANFD` / `ErrorFrame` 行で hard error し、以後の行を全部失う（`samples/logfile.asc` で確認）。フレーム行以外はスキップして読み続ける自前パーサにする。BLF は `blf_asc` のままで実ファイル検証OK
 - [ ] BLF コンテナの解凍を並列化（rayon）— *最適化。ベンチマークには実際のマルチGBサンプルが必要*
 - [ ] 初回インジェスト時の Parquet（または列指向）キャッシュ → 再オープンを即時化
 - [ ] 非常に大きなファイル向けの mmap ベース読み込み
