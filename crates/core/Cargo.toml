@@ -1,0 +1,32 @@
+[package]
+name = "slipstream-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless CAN log analysis core: BLF/ASC ingest, DBC decode, columnar store, view-driven query API."
+
+[lib]
+name = "slipstream_core"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# BLF/ASC reading (and writing, used by tests). Single-threaded iterator today;
+# parallel container decompression is a planned optimization (see CLAUDE.md P0).
+blf_asc = "0.2"
+
+# DBC database parsing (P1).
+can-dbc = "9"
+
+# --- Planned heavy deps (kept out until their modules are filled in):
+# rayon      = "1"            # parallel BLF container decompression / ASC chunk parse
+# memmap2    = "0.9"          # mmap large logs
+# polars     = { version = "0.x", features = ["lazy", "parquet"] }  # analytics + Parquet cache
+# can-dbc    = "9"            # DBC parsing (P1)
+# quick-xml  = "0.x"          # ODX parsing (P2)
+
+[dev-dependencies]
+# blf_asc's writers are used to synthesize fixtures for round-trip ingest tests.

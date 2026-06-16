@@ -1,0 +1,18 @@
+[package]
+name = "slipstream-gui-egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "egui front-end for slipstream-core (the dev/validation UI; a Tauri front-end will reuse the same core query API)."
+
+[[bin]]
+name = "slipstream"
+path = "src/main.rs"
+
+[dependencies]
+slipstream-core = { path = "../core" }
+eframe = "0.31"
+egui = "0.31"
+egui_plot = "0.31"
+egui_extras = "0.31"

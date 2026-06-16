@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local sample logs / generated caches — never commit large binaries.
+/samples
+*.blf
+*.asc
+*.parquet
+.cache/
