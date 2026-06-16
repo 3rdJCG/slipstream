@@ -32,6 +32,9 @@ pub struct App {
     /// Inclusive time-range bounds as text; empty = open bound.
     filter_t_start: String,
     filter_t_end: String,
+    // --- Config tab state --------------------------------------------------
+    /// Last load error (log or DBC), shown in the Config tab; `None` = no error.
+    config_error: Option<String>,
 }
 
 impl App {
@@ -48,6 +51,7 @@ impl App {
             filter_id: String::new(),
             filter_t_start: String::new(),
             filter_t_end: String::new(),
+            config_error: None,
         }
     }
 }
@@ -65,6 +69,7 @@ impl eframe::App for App {
             filter_id,
             filter_t_start,
             filter_t_end,
+            config_error,
         } = self;
 
         // --- Tab bar -------------------------------------------------------
@@ -77,7 +82,7 @@ impl eframe::App for App {
         });
 
         match tab {
-            Tab::Config => config_tab(ctx, session, signals),
+            Tab::Config => config_tab(ctx, session, signals, t_end, config_error),
             Tab::Analysis => {
                 analysis_tab(ctx, session, filter_id, filter_t_start, filter_t_end)
             }
@@ -86,17 +91,60 @@ impl eframe::App for App {
     }
 }
 
-/// Config tab — loaded-state summary and (placeholder) open buttons.
-fn config_tab(ctx: &egui::Context, session: &Session, signals: &[SignalMeta]) {
+/// Config tab — loaded-state summary and file/DBC open buttons.
+///
+/// Loading mutates the shared [`Session`] in place; refreshing `signals`/`t_end`
+/// here is what makes the change visible to the Analysis/Graph tabs immediately
+/// (they read from the same `Session` and the refreshed view state).
+fn config_tab(
+    ctx: &egui::Context,
+    session: &mut Session,
+    signals: &mut Vec<SignalMeta>,
+    t_end: &mut f64,
+    config_error: &mut Option<String>,
+) {
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.heading("Config");
         ui.separator();
 
         ui.horizontal(|ui| {
-            // Placeholders: the real ingest/dialog pipeline is P0/P1 (no rfd yet).
-            let _ = ui.button("Open log… (TODO)");
-            let _ = ui.button("Open DBC… (TODO)");
+            if ui.button("Open log…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CAN log", &["blf", "asc"])
+                    .pick_file()
+                {
+                    match session.load_log(&path) {
+                        Ok(()) => {
+                            // Reflect the new log in every tab: refresh the signal
+                            // list (DBC unchanged but recomputed for consistency)
+                            // and reset the plot window to the full duration.
+                            *signals = session.available_signals();
+                            *t_end = session.duration();
+                            *config_error = None;
+                        }
+                        Err(e) => *config_error = Some(format!("Open log failed: {e}")),
+                    }
+                }
+            }
+            if ui.button("Open DBC…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("DBC", &["dbc"])
+                    .pick_file()
+                {
+                    match session.load_dbc(&path) {
+                        Ok(()) => {
+                            *signals = session.available_signals();
+                            *config_error = None;
+                        }
+                        Err(e) => *config_error = Some(format!("Open DBC failed: {e}")),
+                    }
+                }
+            }
         });
+
+        if let Some(err) = config_error {
+            ui.colored_label(egui::Color32::RED, err.as_str());
+        }
         ui.separator();
 
         egui::Grid::new("config_state")

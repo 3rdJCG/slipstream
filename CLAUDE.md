@@ -68,16 +68,16 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [ ] バス負荷率（bus load %。channel ごと、時間窓で算出）
 - [ ] エクスポート（フィルタ済み行 / デコード済みシグナル / 健全性レポートを出力。まず CSV、のち Parquet）
 - [ ] ログ比較 / diff（2つのログを並べて表示。回帰/異常ビュー）
-- [ ] CLI のみではなくファイルを開くダイアログ（`rfd`）
+- [x] CLI のみではなくファイルを開くダイアログ（`rfd`）
 - [ ] 複数シグナルのプロット軸 / カーソル / 範囲ズーム
 
 ### P1 — Session / DBC 管理（状態の可変化）
 タブ UI は同一 `core::Session` を共有するため、`open` 後に状態を変えられる経路が要る
 （現状の `Session` は構築時固定）。
-- [ ] `Session` を可変化：`open` 後に DBC を後付けロード / 差し替え（`load_dbc` / `set_dbc`）
+- [x] `Session` を可変化：`open` 後に DBC を後付けロード / 差し替え（`load_dbc` / `set_dbc`）
 - [ ] 複数 DBC + **channel→DBC マッピング**（channel/bus ごとに別の DBC を適用。`DbcDatabase` の単一前提を見直す）
 - [ ] シグナル同定を `Message.Signal` で修飾（同名衝突を回避。`find_signal(name)` のグローバル名引きを置換）
-- [ ] Config タブでのロード/設定変更を Analysis/Graph に即時反映する経路
+- [x] Config タブでのロード/設定変更を Analysis/Graph に即時反映する経路
 
 ### P1 — シグナル述語エンジン（検索・フィルタ・ゲート共通）
 値の閾値・比較を時間軸上で評価する述語型を `core` に1つ用意し、検索/フィルタ・

@@ -191,6 +191,29 @@ impl Session {
         Ok(session)
     }
 
+    /// Replace this session's DBC (e.g. loaded later from the Config tab).
+    /// `available_signals` reads the DBC live, so callers see the new signals
+    /// immediately — nothing to invalidate.
+    pub fn set_dbc(&mut self, dbc: DbcDatabase) {
+        self.dbc = dbc;
+    }
+
+    /// Load a `.dbc` file and set it as this session's DBC, replacing any
+    /// existing one.
+    pub fn load_dbc(&mut self, path: &std::path::Path) -> Result<()> {
+        self.dbc = DbcDatabase::load(path)?;
+        Ok(())
+    }
+
+    /// Re-ingest a BLF/ASC log into this session: replace the frame store and
+    /// recompute the duration. The DBC is kept as-is.
+    pub fn load_log(&mut self, path: &std::path::Path) -> Result<()> {
+        let frames = crate::ingest::parse(path)?;
+        self.duration = frames.timestamp.last().copied().unwrap_or(0.0);
+        self.store = FrameStore::new(frames);
+        Ok(())
+    }
+
     pub fn duration(&self) -> f64 {
         self.duration
     }
@@ -688,5 +711,38 @@ mod tests {
         let v = s.check_health(&set);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ViolationKind::NoData);
+    }
+
+    #[test]
+    fn set_dbc_empty_clears_signals() {
+        let mut s = Session::demo();
+        assert!(!s.available_signals().is_empty());
+        // Swapping in an empty DBC drops all signals (read live, no cache).
+        s.set_dbc(DbcDatabase::default());
+        assert!(s.available_signals().is_empty());
+    }
+
+    #[test]
+    fn load_dbc_from_file_populates_signals() {
+        // A default session has no DBC, so no signals.
+        let mut s = Session::demo();
+        s.set_dbc(DbcDatabase::default());
+        assert!(s.available_signals().is_empty());
+
+        // Write a tiny DBC to a temp file and load it.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("slipstream_test_{}.dbc", std::process::id()));
+        std::fs::write(
+            &path,
+            "VERSION \"\"\n\nBO_ 256 EngineData: 8 ECU\n SG_ Rpm : 0|16@1+ (0.25,0) [0|16383] \"rpm\" Vector__XXX\n",
+        )
+        .expect("write temp dbc");
+
+        s.load_dbc(&path).expect("load_dbc");
+        let _ = std::fs::remove_file(&path);
+
+        let signals = s.available_signals();
+        assert!(!signals.is_empty());
+        assert!(signals.iter().any(|m| m.name == "Rpm"));
     }
 }
