@@ -272,6 +272,12 @@ fn analysis_tab(
         };
         ui.label(format!("matching frames: {total}"));
 
+        // Render the health section (bounded content) BEFORE the frame table:
+        // the frame table is virtualized and fills remaining height, so it must
+        // be the last widget in the panel or it overlaps what follows.
+        health_section(ui, session, health_tolerance);
+        ui.separator();
+
         TableBuilder::new(ui)
             .id_salt("frame_table")
             .striped(true)
@@ -327,9 +333,6 @@ fn analysis_tab(
                     }
                 });
             });
-
-        ui.separator();
-        health_section(ui, session, health_tolerance);
     });
 }
 
@@ -440,6 +443,10 @@ fn health_section(ui: &mut egui::Ui, session: &Session, health_tolerance: &mut f
                 .id_salt("health_violation_table")
                 .striped(true)
                 .resizable(true)
+                // Bounded + shrink-to-content so this virtualized table sits
+                // inside the collapsing section instead of trying to fill it.
+                .auto_shrink([false, true])
+                .max_scroll_height(180.0)
                 .column(Column::auto())
                 .column(Column::auto())
                 .column(Column::auto())
