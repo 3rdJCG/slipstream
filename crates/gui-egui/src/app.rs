@@ -206,6 +206,39 @@ fn config_tab(
                     }
                 }
             }
+            ui.separator();
+            if ui.button("Save project…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("slipstream project", &["json"])
+                    .save_file()
+                {
+                    match session.save_project(&path) {
+                        Ok(()) => {
+                            *config_error =
+                                Some(format!("Saved project to {}", basename(&path.display().to_string())));
+                        }
+                        Err(e) => *config_error = Some(format!("Save project failed: {e}")),
+                    }
+                }
+            }
+            if ui.button("Open project…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("slipstream project", &["json"])
+                    .pick_file()
+                {
+                    // Replace the whole session with the loaded one, then refresh
+                    // the derived view state so every tab reflects the new setup.
+                    match Session::load_project(&path) {
+                        Ok(loaded) => {
+                            *session = loaded;
+                            *signals = session.available_signals();
+                            *t_end = session.duration();
+                            *config_error = None;
+                        }
+                        Err(e) => *config_error = Some(format!("Open project failed: {e}")),
+                    }
+                }
+            }
         });
 
         if let Some(err) = config_error {

@@ -186,6 +186,32 @@ pub struct MessageDiff {
     pub mean_dt_b: Option<f64>,
 }
 
+/// One DBC entry in a saved project: its file path and the channel it applies
+/// to (`None` = all channels).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectDbc {
+    pub path: String,
+    #[serde(default)]
+    pub channel: Option<u8>,
+}
+
+/// A saveable project: the set of log/DBC files (plus channel mapping) that
+/// make up the current setup, so it can be reopened later. Only files with a
+/// real path on disk are captured (the synthetic demo log/DBC are skipped).
+/// Health rules and view state may be added in a future version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectFile {
+    /// Schema version (currently `1`).
+    pub version: u32,
+    /// Log file paths, in load order.
+    pub logs: Vec<String>,
+    /// DBC files with their channel mapping, in load order.
+    pub dbcs: Vec<ProjectDbc>,
+}
+
+/// Current project schema version.
+const PROJECT_VERSION: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // Session — owns loaded state, answers queries
 // ---------------------------------------------------------------------------
@@ -296,6 +322,65 @@ impl Session {
     pub fn open_with_dbc(log: &std::path::Path, dbc: &std::path::Path) -> Result<Self> {
         let mut session = Self::open(log)?;
         session.add_dbc(dbc, None)?;
+        Ok(session)
+    }
+
+    /// An empty session — no logs, no DBCs. Useful as the base for building up
+    /// a session from a saved project.
+    pub fn empty() -> Self {
+        Self::from_parts(Vec::new(), Vec::new(), 0)
+    }
+
+    // --- project save / reopen --------------------------------------------
+
+    /// Build a [`ProjectFile`] capturing the current setup and write it as
+    /// pretty JSON to `path`. Only logs/DBCs with a real file path are
+    /// included; the synthetic demo log (`<demo>`) and the demo DBC (path
+    /// `None`) are skipped.
+    pub fn save_project(&self, path: &std::path::Path) -> Result<()> {
+        let logs = self
+            .logs
+            .iter()
+            .filter(|l| l.path != std::path::Path::new("<demo>"))
+            .map(|l| l.path.display().to_string())
+            .collect();
+        let dbcs = self
+            .dbcs
+            .iter()
+            .filter_map(|d| {
+                d.path.as_ref().map(|p| ProjectDbc {
+                    path: p.display().to_string(),
+                    channel: d.channel,
+                })
+            })
+            .collect();
+        let project = ProjectFile {
+            version: PROJECT_VERSION,
+            logs,
+            dbcs,
+        };
+        let json = serde_json::to_string_pretty(&project)
+            .map_err(|e| Error::Parse(format!("project serialize: {e}")))?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Read and parse a [`ProjectFile`] from `path`, then build a fresh session
+    /// by opening each log and DBC it lists. Best-effort: a path that fails to
+    /// open is skipped (the caller can compare the returned counts against the
+    /// project to surface what is missing); a project with zero entries yields
+    /// an empty session.
+    pub fn load_project(path: &std::path::Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let project: ProjectFile =
+            serde_json::from_str(&text).map_err(|e| Error::Parse(format!("project parse: {e}")))?;
+        let mut session = Self::empty();
+        for log in &project.logs {
+            let _ = session.add_log(std::path::Path::new(log));
+        }
+        for dbc in &project.dbcs {
+            let _ = session.add_dbc(std::path::Path::new(&dbc.path), dbc.channel);
+        }
         Ok(session)
     }
 
@@ -1514,5 +1599,55 @@ mod tests {
 
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn project_save_load_roundtrip() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let log_a = dir.join(format!("slipstream_proj_a_{pid}.asc"));
+        let log_b = dir.join(format!("slipstream_proj_b_{pid}.asc"));
+        let dbc = dir.join(format!("slipstream_proj_{pid}.dbc"));
+        let proj = dir.join(format!("slipstream_proj_{pid}.json"));
+        std::fs::write(&log_a, "0.0 1 100 Rx d 1 11\n0.1 1 100 Rx d 1 22\n").unwrap();
+        std::fs::write(&log_b, "0.0 2 200 Rx d 1 33\n").unwrap();
+        std::fs::write(
+            &dbc,
+            "VERSION \"\"\n\nBO_ 256 EngineData: 8 ECU\n SG_ Rpm : 0|16@1+ (0.25,0) [0|16383] \"rpm\" Vector__XXX\n",
+        )
+        .unwrap();
+
+        // Build a session of two logs + one DBC scoped to channel 1.
+        let mut s = Session::open(&log_a).unwrap();
+        s.add_log(&log_b).unwrap();
+        s.add_dbc(&dbc, Some(1)).unwrap();
+        s.save_project(&proj).expect("save_project");
+
+        // Reopen from the project file.
+        let reopened = Session::load_project(&proj).expect("load_project");
+        assert_eq!(reopened.list_logs().len(), 2);
+        let dbcs = reopened.list_dbcs();
+        assert_eq!(dbcs.len(), 1);
+        assert_eq!(dbcs[0].channel, Some(1)); // channel mapping survived
+
+        let _ = std::fs::remove_file(&log_a);
+        let _ = std::fs::remove_file(&log_b);
+        let _ = std::fs::remove_file(&dbc);
+        let _ = std::fs::remove_file(&proj);
+    }
+
+    #[test]
+    fn project_save_skips_demo_synthetics() {
+        let proj = std::env::temp_dir().join(format!("slipstream_demo_proj_{}.json", std::process::id()));
+        // The demo session has a `<demo>` log and a path-`None` DBC, both of
+        // which must be skipped — the resulting project has zero entries.
+        let s = Session::demo();
+        s.save_project(&proj).expect("save_project");
+
+        let reopened = Session::load_project(&proj).expect("load_project");
+        assert_eq!(reopened.list_logs().len(), 0);
+        assert_eq!(reopened.list_dbcs().len(), 0);
+
+        let _ = std::fs::remove_file(&proj);
     }
 }
