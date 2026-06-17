@@ -222,7 +222,7 @@ fn extract_bits(data: &[u8], start: usize, len: usize, order: ByteOrder) -> Opti
                 let byte = *data.get(bit_pos / 8)?;
                 let bit = (byte >> (bit_pos % 8)) & 1;
                 result = (result << 1) | bit as u64;
-                if bit_pos % 8 == 0 {
+                if bit_pos.is_multiple_of(8) {
                     // Cross to bit 7 of the next byte.
                     bit_pos += 15;
                 } else {

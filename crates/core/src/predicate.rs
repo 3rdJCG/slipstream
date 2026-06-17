@@ -35,9 +35,10 @@ impl Compare {
 }
 
 /// A composable predicate over decoded signal values and time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum Predicate {
     /// Always true (no constraint).
+    #[default]
     Always,
     /// `signal op value`, with the signal value held forward between samples.
     Signal {
@@ -53,12 +54,6 @@ pub enum Predicate {
     Any(Vec<Predicate>),
     /// Negation.
     Not(Box<Predicate>),
-}
-
-impl Default for Predicate {
-    fn default() -> Self {
-        Predicate::Always
-    }
 }
 
 /// Precomputed evaluator: signal leaves are decoded once into sorted

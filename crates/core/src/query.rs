@@ -667,7 +667,7 @@ impl Session {
                 filter.matches(cols, i)
                     && pred
                         .as_ref()
-                        .map_or(true, |e| e.is_active(cols.timestamp[i]))
+                        .is_none_or(|e| e.is_active(cols.timestamp[i]))
             })
             .collect()
     }

@@ -118,18 +118,44 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [x] DBC・手動ルールいずれにも該当しない ID を「未知フレーム」として一覧（`Session::unknown_frame_ids` — どの DBC メッセージにも無い distinct can_id を昇順で返す）
 - [x] 結果スキーマ：RPC 形式の `HealthReport` 型（違反フレーム・違反区間・周期統計）を定義
 - [x] チェック結果を Analysis タブに表示（違反一覧 + 違反区間。行テーブルと連動）
+- [x] **ID 別健全性タイムライン**（Health タブ中央。`egui_plot` でルールごとに 1
+      レーン、緑=存在区間 [first_t,last_t]・赤=違反区間 [t_start,t_end] を矩形描画。
+      y 軸はレーン→`0x{can_id:X}`。メモ化済み `HealthReport`/`MessageStats` のみ使用）
 - [x] 健全性ルールセットの保存 / 読み込み（core: `health::HealthRuleSet::save/load`、JSON。手動ルール + ゲートを 1 セットで永続化）
       - メモ: ゲートは述語エンジン（`predicate::Predicate`、AND/OR/Not 対応）に統合済み。ヒステリシス・`(can_id,channel)` 粒度・`HealthReport` 型・ゲート構築 UI は上記未チェック項目で対応予定
 
 ### P1 — 画面構成（タブ UI シェル）
 タブで画面を切り替える構成にする。各タブは同一の `core::Session` を共有し、タブ
-自体は egui 側の薄いビュー（状態は `core` に置く 3 ルールを守る）。タブ名は仮称、
-適宜変更してよい。
+自体は egui 側の薄いビュー（状態は `core` に置く 3 ルールを守る）。Phase 1 の
+UI 刷新で **5 タブ（Setup / Trace / Graphics / Health / Diff）** に再編。各タブ
+（Setup を除く）は左に `SidePanel::left`（操作・選択）、中央に `CentralPanel`
+（主ビュー）を置くレイアウト（`gui-egui/src/app.rs`、関数 `setup_tab` /
+`trace_tab` / `graphics_tab` / `health_tab` / `diff_tab`）。重いデータは引き続き
+メモ化済みの `AnalysisCache` から読む（タブ先頭で `acache.refresh` を 1 回）。
 - [x] タブ切り替えのシェル（トップレベルのタブバー + 各タブのビュー）
-- [x] **Config** タブ — BLF/ASC ファイルの読み込み、DBC の設定、インジェスト進捗の表示
-- [x] **Analysis** タブ — フレーム単位の解析（行テーブル / 検索・フィルタ / 統計 / 健全性のルール設定＋結果）
-- [x] **Graph** タブ — デコード済みシグナルのプロット（カーソル読み出し / 範囲ズーム再間引き / 正規化トグル。真のマルチ Y 軸は今後）
-- [x] **Diff** タブ — 2つのログを CAN id 単位で比較（`Session::diff_logs`、存在差分・件数・Δ件数・平均周期のテーブル表示。OnlyA/OnlyB を色分け）
+- [x] **Setup** タブ — BLF/ASC・DBC・プロジェクトの読み込み、ロード済み LOG/DBC 一覧
+      （個別削除 + DBC の channel 割り当て）、状態サマリ（frames/duration/signals）。
+      設定タブなので単一カラム。
+- [x] **Trace** タブ — フレーム中心。左: フィルタ（CAN id / t≥/t≤ / channel ON/OFF）+
+      「matching frames: N」+ フレーム CSV エクスポート + Messages テーブル
+      （message_stats × cycle jitter）+ Bus load 折りたたみ。中央: 仮想化フレーム
+      テーブル（最後のウィジェット）。
+- [x] **Graphics** タブ — デコード済みシグナルのプロット。左: メッセージ名で
+      グループ化したシグナルツリー（折りたたみ）+ 正規化トグル + シグナル CSV
+      エクスポート。中央: egui_plot（カーソル読み出し / 範囲ズーム再間引き /
+      正規化。真のマルチ Y 軸は今後）。
+- [x] **Health** タブ — フレーム健全性。左: 許容差（%/ms）+ 値、DBC 由来ルール数、
+      手動ルール追加フォーム + 一覧（削除）、未知フレーム一覧。中央: **ID 別
+      健全性タイムライン**（Phase 2 実装。`egui_plot`。ルールごとに 1 レーン
+      = y 軸 0..N。各レーンに緑の半透明矩形でメッセージの存在区間
+      [first_t, last_t]（`AnalysisCache.msgs` から引く）、赤の半透明矩形で
+      各違反区間 [t_start, t_end] を重畳。y 軸は `y_axis_formatter` でレーン
+      番号 → `0x{can_id:X}` に変換。高さは ~24px×レーン数で上下限クランプ。
+      新規スキャンは一切行わずメモ化済み `HealthReport`/`MessageStats` のみで
+      描画）+ 各ルール集計テーブル + 違反テーブル + health CSV エクスポート。
+- [x] **Diff** タブ — 2つのログを CAN id 単位で比較（`Session::diff_logs`、存在差分・
+      件数・Δ件数・平均周期のテーブル表示。OnlyA/OnlyB を色分け）。左: ログ 2 つの
+      ピッカー（ComboBox）、中央: diff テーブル。
 - [ ] タブ間で選択状態（時間範囲・対象 ID/シグナル）を共有・連動させる
 - [x] 各タブの空状態（log 未ロード / DBC 未設定）の表示
 

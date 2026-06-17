@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use egui_extras::{Column, TableBuilder};
-use egui_plot::{Legend, Line, Plot, PlotPoints, VLine};
+use egui_plot::{GridMark, Legend, Line, Plot, PlotPoints, Polygon, VLine};
 
-use slipstream_core::health::{HealthReport, HealthRule, Tolerance};
+use slipstream_core::health::{HealthReport, HealthRule, HealthRuleSet, Tolerance};
 use slipstream_core::model::SignalMeta;
 use slipstream_core::predicate::Predicate;
 use slipstream_core::query::{
@@ -12,10 +12,10 @@ use slipstream_core::query::{
 };
 use slipstream_core::Session;
 
-/// Memoized results of the (O(n)) Analysis/Graph queries. Each field is paired
+/// Memoized results of the (O(n)) Trace/Graphics/Health queries. Each field is paired
 /// with the key it was computed from; [`AnalysisCache::refresh`] recomputes a
 /// field only when its key changed, so a 50 MB log isn't re-scanned on every
-/// repaint. `data_epoch` bumps on any session mutation (see `config_tab`),
+/// repaint. `data_epoch` bumps on any session mutation (see `setup_tab`),
 /// invalidating everything that depends on the loaded data.
 #[derive(Default)]
 struct AnalysisCache {
@@ -46,9 +46,9 @@ struct AnalysisCache {
 }
 
 impl AnalysisCache {
-    /// Refresh the Analysis-tab caches whose keys changed. Called once near the
-    /// top of `analysis_tab`; the per-section render code then reads the cached
-    /// fields without re-querying the session.
+    /// Refresh the Trace/Health-tab caches whose keys changed. Called once near
+    /// the top of `trace_tab`/`health_tab`; the per-section render code then reads
+    /// the cached fields without re-querying the session.
     #[allow(clippy::too_many_arguments)]
     fn refresh(
         &mut self,
@@ -97,21 +97,7 @@ impl AnalysisCache {
             manual_rules.to_vec(),
         );
         if self.health_key != health_key {
-            let tolerance = if tol_abs {
-                Tolerance::AbsSeconds(tol_value / 1000.0)
-            } else {
-                Tolerance::Percent(tol_value)
-            };
-            let mut rules = session.dbc_health_rules(tolerance);
-            for &(can_id, expected_ms) in manual_rules {
-                rules.rules.push(HealthRule {
-                    can_id,
-                    name: format!("manual 0x{can_id:X}"),
-                    expected_dt: expected_ms / 1000.0,
-                    tolerance,
-                    gate: Predicate::Always,
-                });
-            }
+            let rules = build_health_rules(session, tol_abs, tol_value, manual_rules);
             self.health = if rules.rules.is_empty() {
                 None
             } else {
@@ -128,7 +114,7 @@ impl AnalysisCache {
         }
     }
 
-    /// Refresh the Graph-tab decimation cache, re-decoding only when the
+    /// Refresh the Graphics-tab decimation cache, re-decoding only when the
     /// selection, zoom window, pixel width, normalize toggle, or data change.
     #[allow(clippy::too_many_arguments)]
     fn refresh_graph(
@@ -171,12 +157,15 @@ impl AnalysisCache {
     }
 }
 
-/// Top-level tabs. Each is a thin view over the *same* [`Session`].
+/// Top-level tabs. Each is a thin view over the *same* [`Session`]. Each tab
+/// (except Setup) lays out a resizable left `SidePanel` for controls/selection
+/// and a `CentralPanel` for the main visualization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    Config,
-    Analysis,
-    Graph,
+    Setup,
+    Trace,
+    Graphics,
+    Health,
     Diff,
 }
 
@@ -187,9 +176,9 @@ pub struct App {
     signals: Vec<SignalMeta>,
     /// Which tab is currently shown.
     tab: Tab,
-    // --- Graph tab state ---------------------------------------------------
+    // --- Graphics tab state ------------------------------------------------
     selected: BTreeSet<String>,
-    /// Decoded-signal duration `[0, t_end]`; refreshed on load for the Config
+    /// Decoded-signal duration `[0, t_end]`; refreshed on load for the Setup
     /// summary and as the default decimation window.
     t_end: f64,
     /// Visible x-range of the plot, captured last frame and used to re-decimate
@@ -200,7 +189,7 @@ pub struct App {
     /// When set, each signal is scaled to 0..1 by its own decimated min/max
     /// (a stand-in for true multi-Y-axis plotting, which egui_plot lacks).
     plot_normalize: bool,
-    // --- Analysis tab filter inputs ----------------------------------------
+    // --- Trace/Health tab filter inputs ------------------------------------
     /// Hex CAN id text (e.g. `100`, `0x200`); empty = no id constraint.
     filter_id: String,
     /// Inclusive time-range bounds as text; empty = open bound.
@@ -212,7 +201,7 @@ pub struct App {
     /// Tolerance value: a fraction (e.g. `0.3` = ±30%) when `health_tol_abs` is
     /// false, or milliseconds when it is true.
     health_tol_value: f64,
-    /// Manual health rules `(can_id, expected_ms)` added in the Analysis tab for
+    /// Manual health rules `(can_id, expected_ms)` added in the Health tab for
     /// frames the DBC doesn't declare a cycle time for. They reuse the tolerance
     /// above and an `Always` gate.
     manual_rules: Vec<(u32, f64)>,
@@ -220,17 +209,17 @@ pub struct App {
     new_rule_id: String,
     /// Expected-period-in-ms text for the "add manual rule" form.
     new_rule_ms: String,
-    /// Channels selected in the Analysis-tab filter; empty = all channels.
+    /// Channels selected in the Trace/Health-tab filter; empty = all channels.
     channel_filter: BTreeSet<u8>,
-    /// Bus-load nominal bitrate in bits/s (Analysis tab).
+    /// Bus-load nominal bitrate in bits/s (Trace tab).
     bus_bitrate: u32,
-    /// Bus-load aggregation window in seconds (Analysis tab).
+    /// Bus-load aggregation window in seconds (Trace tab).
     bus_window: f64,
-    // --- Config tab state --------------------------------------------------
-    /// Last load error (log or DBC), shown in the Config tab; `None` = no error.
+    // --- Setup tab state ---------------------------------------------------
+    /// Last load error (log or DBC), shown in the Setup tab; `None` = no error.
     config_error: Option<String>,
     /// Last CSV-export result (success row count or error), shown in the
-    /// Analysis/Graph tabs; `None` = nothing exported yet this session.
+    /// Trace/Graphics/Health tabs; `None` = nothing exported yet this session.
     export_status: Option<String>,
     // --- Diff tab state ----------------------------------------------------
     /// Selected log id for side A of the diff (`None` = not yet chosen).
@@ -238,11 +227,11 @@ pub struct App {
     /// Selected log id for side B of the diff (`None` = not yet chosen).
     diff_b: Option<u32>,
     // --- Memoization -------------------------------------------------------
-    /// Bumped on every successful session mutation (in `config_tab`). Used as
-    /// part of each cache key so the Analysis/Graph queries recompute when the
-    /// loaded data changes.
+    /// Bumped on every successful session mutation (in `setup_tab`). Used as
+    /// part of each cache key so the Trace/Graphics/Health queries recompute when
+    /// the loaded data changes.
     data_epoch: u64,
-    /// Memoized Analysis/Graph query results (see [`AnalysisCache`]).
+    /// Memoized Trace/Graphics/Health query results (see [`AnalysisCache`]).
     acache: AnalysisCache,
 }
 
@@ -253,7 +242,7 @@ impl App {
         Self {
             session,
             signals,
-            tab: Tab::Config,
+            tab: Tab::Setup,
             selected: BTreeSet::new(),
             t_end,
             plot_x_range: None,
@@ -314,16 +303,17 @@ impl eframe::App for App {
         // --- Tab bar -------------------------------------------------------
         egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(tab, Tab::Config, "Config");
-                ui.selectable_value(tab, Tab::Analysis, "Analysis");
-                ui.selectable_value(tab, Tab::Graph, "Graph");
+                ui.selectable_value(tab, Tab::Setup, "Setup");
+                ui.selectable_value(tab, Tab::Trace, "Trace");
+                ui.selectable_value(tab, Tab::Graphics, "Graphics");
+                ui.selectable_value(tab, Tab::Health, "Health");
                 ui.selectable_value(tab, Tab::Diff, "Diff");
             });
         });
 
         match tab {
-            Tab::Config => config_tab(ctx, session, signals, t_end, config_error, data_epoch),
-            Tab::Analysis => analysis_tab(
+            Tab::Setup => setup_tab(ctx, session, signals, t_end, config_error, data_epoch),
+            Tab::Trace => trace_tab(
                 ctx,
                 session,
                 *data_epoch,
@@ -334,14 +324,12 @@ impl eframe::App for App {
                 health_tol_abs,
                 health_tol_value,
                 manual_rules,
-                new_rule_id,
-                new_rule_ms,
                 channel_filter,
                 bus_bitrate,
                 bus_window,
                 export_status,
             ),
-            Tab::Graph => graph_tab(
+            Tab::Graphics => graphics_tab(
                 ctx,
                 session,
                 *data_epoch,
@@ -353,17 +341,34 @@ impl eframe::App for App {
                 plot_normalize,
                 export_status,
             ),
+            Tab::Health => health_tab(
+                ctx,
+                session,
+                *data_epoch,
+                acache,
+                filter_id,
+                filter_t_start,
+                filter_t_end,
+                channel_filter,
+                health_tol_abs,
+                health_tol_value,
+                manual_rules,
+                new_rule_id,
+                new_rule_ms,
+                export_status,
+            ),
             Tab::Diff => diff_tab(ctx, session, diff_a, diff_b),
         }
     }
 }
 
-/// Config tab — loaded-state summary and file/DBC open buttons.
+/// Setup tab — loaded-state summary and file/DBC/project open buttons. Settings
+/// only, so it stays single-column (no left/center split).
 ///
 /// Loading mutates the shared [`Session`] in place; refreshing `signals`/`t_end`
-/// here is what makes the change visible to the Analysis/Graph tabs immediately
-/// (they read from the same `Session` and the refreshed view state).
-fn config_tab(
+/// here is what makes the change visible to the Trace/Graphics/Health tabs
+/// immediately (they read from the same `Session` and the refreshed view state).
+fn setup_tab(
     ctx: &egui::Context,
     session: &mut Session,
     signals: &mut Vec<SignalMeta>,
@@ -372,7 +377,7 @@ fn config_tab(
     data_epoch: &mut u64,
 ) {
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading("Config");
+        ui.heading("Setup");
         ui.separator();
 
         // Empty state: when nothing is loaded (no logs and no DBCs), nudge the
@@ -585,42 +590,44 @@ fn channels_label(channels: &[u8]) -> String {
     }
 }
 
-/// Analysis tab — filterable virtualized frame table plus per-id cycle stats.
-#[allow(clippy::too_many_arguments)]
-fn analysis_tab(
-    ctx: &egui::Context,
+/// Build the [`HealthRuleSet`] for the current tolerance + manual rules: the
+/// DBC-derived cycle rules plus one `Always`-gated rule per manual entry. Shared
+/// by [`AnalysisCache::refresh`] (per-frame, keyed) and the Health-tab CSV export
+/// (one-shot on click), so the two never disagree on which rules are checked.
+fn build_health_rules(
     session: &Session,
-    data_epoch: u64,
-    acache: &mut AnalysisCache,
-    filter_id: &mut String,
-    filter_t_start: &mut String,
-    filter_t_end: &mut String,
-    health_tol_abs: &mut bool,
-    health_tol_value: &mut f64,
-    manual_rules: &mut Vec<(u32, f64)>,
-    new_rule_id: &mut String,
-    new_rule_ms: &mut String,
-    channel_filter: &mut BTreeSet<u8>,
-    bus_bitrate: &mut u32,
-    bus_window: &mut f64,
-    export_status: &mut Option<String>,
-) {
-    // Empty state: with no frames loaded, skip rendering the (virtualized) frame
-    // and message tables entirely and show a single prominent hint. The tab stays
-    // usable — switching tabs and loading a log in Config still works.
-    if session.frame_count() == 0 {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Frames");
-            ui.separator();
-            ui.centered_and_justified(|ui| {
-                ui.label("No frames. Load a BLF/ASC log in the Config tab.");
-            });
+    tol_abs: bool,
+    tol_value: f64,
+    manual_rules: &[(u32, f64)],
+) -> HealthRuleSet {
+    let tolerance = if tol_abs {
+        Tolerance::AbsSeconds(tol_value / 1000.0)
+    } else {
+        Tolerance::Percent(tol_value)
+    };
+    let mut rules = session.dbc_health_rules(tolerance);
+    for &(can_id, expected_ms) in manual_rules {
+        rules.rules.push(HealthRule {
+            can_id,
+            name: format!("manual 0x{can_id:X}"),
+            expected_dt: expected_ms / 1000.0,
+            tolerance,
+            gate: Predicate::Always,
         });
-        return;
     }
+    rules
+}
 
-    // Build a FrameFilter from the (lenient) text inputs. Unparseable fields are
-    // simply treated as "no constraint", so a default filter matches all rows.
+/// Build a [`FrameFilter`] from the (lenient) text/checkbox inputs shared by the
+/// Trace and Health tabs. Unparseable fields are treated as "no constraint", so
+/// a default filter matches all rows. Returns the filter and whether any
+/// constraint is active.
+fn build_filter(
+    filter_id: &str,
+    filter_t_start: &str,
+    filter_t_end: &str,
+    channel_filter: &BTreeSet<u8>,
+) -> (FrameFilter, bool) {
     let mut filter = FrameFilter::default();
     if let Some(id) = parse_hex_id(filter_id) {
         filter.can_ids.push(id);
@@ -634,8 +641,48 @@ fn analysis_tab(
         || filter.t_start.is_some()
         || filter.t_end.is_some()
         || !filter.channels.is_empty();
+    (filter, active)
+}
 
-    // Refresh all Analysis caches ONCE; each recomputes only when its inputs
+/// Trace tab — frame-centric view. LEFT side panel holds the filter, the
+/// per-id Messages table, and a collapsing Bus load section; CENTER holds the
+/// virtualized frame table (kept LAST so it can't overlap preceding widgets).
+/// All heavy data is read from the memoized [`AnalysisCache`].
+#[allow(clippy::too_many_arguments)]
+fn trace_tab(
+    ctx: &egui::Context,
+    session: &Session,
+    data_epoch: u64,
+    acache: &mut AnalysisCache,
+    filter_id: &mut String,
+    filter_t_start: &mut String,
+    filter_t_end: &mut String,
+    health_tol_abs: &mut bool,
+    health_tol_value: &mut f64,
+    manual_rules: &[(u32, f64)],
+    channel_filter: &mut BTreeSet<u8>,
+    bus_bitrate: &mut u32,
+    bus_window: &mut f64,
+    export_status: &mut Option<String>,
+) {
+    // Empty state: with no frames loaded, skip rendering the (virtualized) frame
+    // and message tables entirely and show a single prominent hint. The tab stays
+    // usable — switching tabs and loading a log in Setup still works.
+    if session.frame_count() == 0 {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Trace");
+            ui.separator();
+            ui.centered_and_justified(|ui| {
+                ui.label("No frames. Load a BLF/ASC log in the Setup tab.");
+            });
+        });
+        return;
+    }
+
+    let (filter, active) =
+        build_filter(filter_id, filter_t_start, filter_t_end, channel_filter);
+
+    // Refresh all Trace/Health caches ONCE; each recomputes only when its inputs
     // (or `data_epoch`) changed. Everything below renders from `acache` instead
     // of re-scanning the (potentially millions of) frames on every repaint.
     acache.refresh(
@@ -650,16 +697,77 @@ fn analysis_tab(
         *bus_window,
     );
 
-    // --- Messages (bottom strip) -------------------------------------------
-    // One per-id row, merging presence stats (count, mean_dt from
-    // `message_stats`) with cadence jitter (from `all_cycle_stats`). Both are
-    // sorted ascending by can_id; we index the cycle stats by id so ids with a
-    // single frame (no cadence) still appear, with a blank jitter.
-    egui::TopBottomPanel::bottom("message_stats")
+    // --- LEFT: filter, Messages table, Bus load ----------------------------
+    egui::SidePanel::left("trace_controls")
         .resizable(true)
-        .default_height(200.0)
+        .default_width(360.0)
         .show(ctx, |ui| {
-            ui.heading("Messages");
+            ui.heading("Filter");
+            ui.horizontal(|ui| {
+                ui.label("CAN id (hex):");
+                ui.add(egui::TextEdit::singleline(filter_id).desired_width(80.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("t ≥");
+                ui.add(egui::TextEdit::singleline(filter_t_start).desired_width(64.0));
+                ui.label("t ≤");
+                ui.add(egui::TextEdit::singleline(filter_t_end).desired_width(64.0));
+            });
+
+            // Channel ON/OFF filter (none checked = all channels). Only mutates
+            // App state (`channel_filter`); the selection is read back into
+            // `filter` on the next frame.
+            let channels = session.channels();
+            if !channels.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Channels:");
+                    for ch in channels {
+                        let mut on = channel_filter.contains(&ch);
+                        if ui.checkbox(&mut on, format!("ch {ch}")).changed() {
+                            if on {
+                                channel_filter.insert(ch);
+                            } else {
+                                channel_filter.remove(&ch);
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Matching count off the filter; full row count when no constraint
+            // is set. When a filter is active this reads the memoized index list.
+            let total = if active {
+                acache.filtered.len()
+            } else {
+                session.frame_count() as usize
+            };
+            ui.label(format!("matching frames: {total}"));
+
+            // Export the currently-filtered frames to CSV via the core exporter.
+            ui.horizontal(|ui| {
+                if ui.button("Export frames (CSV)…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .save_file()
+                    {
+                        *export_status = Some(match session.export_frames_csv(&filter, &path) {
+                            Ok(n) => format!("Exported {n} frames to {}", basename(&path.display().to_string())),
+                            Err(e) => format!("Export failed: {e}"),
+                        });
+                    }
+                }
+            });
+            if let Some(status) = export_status.as_deref() {
+                ui.label(status);
+            }
+            ui.separator();
+
+            // --- Messages -------------------------------------------------
+            // One per-id row, merging presence stats (count, mean_dt from
+            // `message_stats`) with cadence jitter (from `all_cycle_stats`). Both
+            // are sorted ascending by can_id; we index the cycle stats by id so
+            // ids with a single frame (no cadence) still appear, blank jitter.
+            ui.strong("Messages");
             let msgs = &acache.msgs;
             let cycles = &acache.cycles;
             let jitter_of = |id: u32| -> Option<f64> {
@@ -672,23 +780,18 @@ fn analysis_tab(
                 .id_salt("message_stats_table")
                 .striped(true)
                 .resizable(true)
+                .auto_shrink([false, true])
+                .max_scroll_height(260.0)
                 .column(Column::auto())
                 .column(Column::auto())
                 .column(Column::auto())
                 .column(Column::remainder())
                 .header(20.0, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("id");
-                    });
-                    header.col(|ui| {
-                        ui.strong("count");
-                    });
-                    header.col(|ui| {
-                        ui.strong("mean_dt");
-                    });
-                    header.col(|ui| {
-                        ui.strong("jitter");
-                    });
+                    for h in ["id", "count", "mean_dt", "jitter"] {
+                        header.col(|ui| {
+                            ui.strong(h);
+                        });
+                    }
                 })
                 .body(|mut body| {
                     for m in msgs {
@@ -714,89 +817,21 @@ fn analysis_tab(
                         });
                     }
                 });
+
+            ui.separator();
+            bus_load_section(ui, &acache.bus, bus_bitrate, bus_window);
         });
 
-    // --- Filter + frame table ----------------------------------------------
+    // --- CENTER: virtualized frame table (LAST widget) ---------------------
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.heading("Frames");
-        ui.horizontal(|ui| {
-            ui.label("CAN id (hex):");
-            ui.add(egui::TextEdit::singleline(filter_id).desired_width(80.0));
-            ui.separator();
-            ui.label("t ≥");
-            ui.add(egui::TextEdit::singleline(filter_t_start).desired_width(64.0));
-            ui.label("t ≤");
-            ui.add(egui::TextEdit::singleline(filter_t_end).desired_width(64.0));
-        });
-
-        // Channel ON/OFF filter (none checked = all channels). Only mutates App
-        // state (`channel_filter`); the selection is read back into `filter`
-        // above on the next frame.
-        let channels = session.channels();
-        if !channels.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label("Channels:");
-                for ch in channels {
-                    let mut on = channel_filter.contains(&ch);
-                    if ui.checkbox(&mut on, format!("ch {ch}")).changed() {
-                        if on {
-                            channel_filter.insert(ch);
-                        } else {
-                            channel_filter.remove(&ch);
-                        }
-                    }
-                }
-            });
-        }
         ui.separator();
 
-        // Drive the count/window off the filter; fall back to all rows when no
-        // constraint is set. The total is the row count for the table. When a
-        // filter is active this reads the memoized index list (no rescan).
         let total = if active {
             acache.filtered.len()
         } else {
             session.frame_count() as usize
         };
-        ui.label(format!("matching frames: {total}"));
-
-        // Export the currently-filtered frames to CSV via the core exporter.
-        ui.horizontal(|ui| {
-            if ui.button("Export frames (CSV)…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("CSV", &["csv"])
-                    .save_file()
-                {
-                    *export_status = Some(match session.export_frames_csv(&filter, &path) {
-                        Ok(n) => format!("Exported {n} frames to {}", basename(&path.display().to_string())),
-                        Err(e) => format!("Export failed: {e}"),
-                    });
-                }
-            }
-            if let Some(status) = export_status.as_deref() {
-                ui.label(status);
-            }
-        });
-
-        // Render the health section (bounded content) BEFORE the frame table:
-        // the frame table is virtualized and fills remaining height, so it must
-        // be the last widget in the panel or it overlaps what follows.
-        health_section(
-            ui,
-            acache.health.as_ref(),
-            &acache.unknown,
-            health_tol_abs,
-            health_tol_value,
-            manual_rules,
-            new_rule_id,
-            new_rule_ms,
-        );
-        ui.separator();
-
-        // Bus load is also bounded content; keep it BEFORE the frame table so the
-        // virtualized table stays last and doesn't overlap it.
-        bus_load_section(ui, &acache.bus, bus_bitrate, bus_window);
-        ui.separator();
 
         TableBuilder::new(ui)
             .id_salt("frame_table")
@@ -808,21 +843,11 @@ fn analysis_tab(
             .column(Column::auto())
             .column(Column::remainder())
             .header(20.0, |mut header| {
-                header.col(|ui| {
-                    ui.strong("#");
-                });
-                header.col(|ui| {
-                    ui.strong("time");
-                });
-                header.col(|ui| {
-                    ui.strong("ch");
-                });
-                header.col(|ui| {
-                    ui.strong("id");
-                });
-                header.col(|ui| {
-                    ui.strong("data");
-                });
+                for h in ["#", "time", "ch", "id", "data"] {
+                    header.col(|ui| {
+                        ui.strong(h);
+                    });
+                }
             })
             .body(|body| {
                 body.rows(18.0, total, |mut row| {
@@ -856,30 +881,54 @@ fn analysis_tab(
     });
 }
 
-/// Maximum number of violation rows the violations table will display, to keep
-/// the per-frame rebuild cheap even when a log has very many violations.
-const HEALTH_VIOLATION_LIMIT: usize = 500;
-
-/// Frame-health section of the Analysis tab (collapsing). Thin view: it renders
-/// the tolerance/manual-rule controls (which only mutate App state — the
-/// [`AnalysisCache`] picks the changes up next frame) and displays the memoized
-/// [`HealthReport`] passed in, plus a (capped) list of individual violations. It
-/// does NOT run the health query itself anymore.
+/// Health tab — frame cadence checks. LEFT side panel holds the tolerance
+/// controls, DBC rule count, the manual-rule add form + list, and the unknown
+/// frames list; CENTER holds the per-rule summary table, the violations table,
+/// and the CSV export (with a marked Phase-2 Timeline spot above the tables).
+/// The memoized [`HealthReport`] is built in [`AnalysisCache::refresh`].
 #[allow(clippy::too_many_arguments)]
-fn health_section(
-    ui: &mut egui::Ui,
-    report: Option<&HealthReport>,
-    unknown: &[u32],
+fn health_tab(
+    ctx: &egui::Context,
+    session: &Session,
+    data_epoch: u64,
+    acache: &mut AnalysisCache,
+    filter_id: &str,
+    filter_t_start: &str,
+    filter_t_end: &str,
+    channel_filter: &BTreeSet<u8>,
     health_tol_abs: &mut bool,
     health_tol_value: &mut f64,
     manual_rules: &mut Vec<(u32, f64)>,
     new_rule_id: &mut String,
     new_rule_ms: &mut String,
+    export_status: &mut Option<String>,
 ) {
-    egui::CollapsingHeader::new("Health (frame cadence)")
-        .default_open(false)
-        .show(ui, |ui| {
-            // --- Tolerance mode + value -----------------------------------
+    // Refresh the cache (keyed, cheap when unchanged). Reuse the Trace-tab filter
+    // so the filtered-index cache stays consistent across tabs.
+    let (filter, active) =
+        build_filter(filter_id, filter_t_start, filter_t_end, channel_filter);
+    acache.refresh(
+        session,
+        data_epoch,
+        &filter,
+        active,
+        *health_tol_abs,
+        *health_tol_value,
+        manual_rules,
+        // Bus-load inputs are owned by the Trace tab; pass the cached key so the
+        // bus computation isn't disturbed (a 0 bitrate would never be a real key).
+        acache.bus_key.1,
+        f64::from_bits(acache.bus_key.2),
+    );
+
+    // --- LEFT: tolerance, rules, manual form, unknown frames ---------------
+    egui::SidePanel::left("health_controls")
+        .resizable(true)
+        .default_width(360.0)
+        .show(ctx, |ui| {
+            ui.heading("Health rules");
+
+            // Tolerance mode + value.
             ui.horizontal(|ui| {
                 ui.label("Tolerance:");
                 egui::ComboBox::from_id_salt("health_tol_mode")
@@ -906,12 +955,19 @@ fn health_section(
                 }
             });
 
+            // DBC-derived rule count: total rules minus the manual ones we appended.
+            let total_rules = acache.health.as_ref().map_or(0, |r| r.rules.len());
+            let dbc_rules = total_rules.saturating_sub(manual_rules.len());
+            ui.label(format!("DBC-derived rules: {dbc_rules}"));
+            ui.separator();
+
             // --- Manual rules (DBC-independent) ---------------------------
-            ui.add_space(4.0);
             ui.strong("Manual rules");
             ui.horizontal(|ui| {
                 ui.label("CAN id (hex):");
                 ui.add(egui::TextEdit::singleline(new_rule_id).desired_width(80.0));
+            });
+            ui.horizontal(|ui| {
                 ui.label("period (ms):");
                 ui.add(egui::TextEdit::singleline(new_rule_ms).desired_width(64.0));
                 if ui.button("Add").clicked() {
@@ -939,10 +995,11 @@ fn health_section(
             if let Some(i) = rule_to_remove {
                 manual_rules.remove(i);
             }
+            ui.separator();
 
             // --- Unknown frames (no DBC/rule) -----------------------------
-            ui.add_space(4.0);
             ui.strong("Unknown frames (no DBC/rule)");
+            let unknown = &acache.unknown;
             if unknown.is_empty() {
                 ui.label("—");
             } else {
@@ -951,137 +1008,284 @@ fn health_section(
                     .map(|id| format!("0x{id:X}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                ui.monospace(list);
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.monospace(list);
+                    });
             }
-            ui.add_space(4.0);
+        });
 
-            // Use the memoized report (built from the DBC + manual rules in
-            // `AnalysisCache::refresh`). `None` means no rules are defined yet.
-            let report = match report {
-                Some(r) => r,
-                None => {
-                    ui.label("Load a DBC in Config or add a manual rule to derive cycle rules.");
-                    return;
+    // --- CENTER: Timeline spot (Phase 2) + summary + violations ------------
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.heading("Health");
+        ui.separator();
+
+        // Per-id health timeline (one lane per rule), driven entirely by the
+        // memoized report + message stats — no new per-frame scan.
+        health_timeline(ui, acache.health.as_ref(), &acache.msgs);
+        ui.separator();
+
+        // Rebuild the ruleset for the CSV export (cheap: O(DBC messages), not
+        // O(frames)); it matches exactly what the memoized report was built from.
+        let rules =
+            build_health_rules(session, *health_tol_abs, *health_tol_value, manual_rules);
+        health_results(ui, acache.health.as_ref(), &rules, export_status, session);
+    });
+}
+
+/// Per-id health timeline (CENTER of the Health tab, above the tables). Thin
+/// view: it draws one horizontal lane per rule in the memoized [`HealthReport`],
+/// using only already-computed data — no new per-frame scan.
+///
+/// Per lane (y = rule index): a translucent GREEN rectangle spans the message's
+/// present interval `[first_t, last_t]` (looked up by `can_id` in the memoized
+/// `MessageStats`; lanes whose id never appears are drawn empty), and a
+/// translucent RED rectangle is overlaid for each cadence violation's
+/// `[t_start, t_end]`. The Y axis maps each integer lane index back to its
+/// `0x{can_id:X}` via [`Plot::y_axis_formatter`]; X is time in seconds.
+fn health_timeline(ui: &mut egui::Ui, report: Option<&HealthReport>, msgs: &[MessageStats]) {
+    ui.strong("Timeline");
+    ui.label("green = present span, red = cadence violation");
+
+    let report = match report {
+        Some(r) => r,
+        None => {
+            ui.label("No rules yet — load a DBC in Setup or add a manual rule.");
+            return;
+        }
+    };
+    if report.rules.is_empty() {
+        ui.label("No rules to plot.");
+        return;
+    }
+
+    // Translucent fills (green = present span, red = violation).
+    let green = egui::Color32::from_rgba_unmultiplied(60, 180, 75, 70);
+    let red = egui::Color32::from_rgba_unmultiplied(220, 60, 60, 110);
+
+    // Axis-aligned rectangle as a 4-point Polygon at lane `idx` ± `half`.
+    let rect = |t0: f64, t1: f64, idx: usize, half: f64| -> Vec<[f64; 2]> {
+        let y = idx as f64;
+        vec![
+            [t0, y - half],
+            [t1, y - half],
+            [t1, y + half],
+            [t0, y + half],
+        ]
+    };
+
+    // Snapshot the per-lane can_id so the y-axis formatter (which outlives this
+    // call via the plot closure) can map an integer lane index back to its id.
+    let lane_ids: Vec<u32> = report.rules.iter().map(|rr| rr.can_id).collect();
+    let n = lane_ids.len();
+
+    // Fixed-ish height: ~24 px per lane, bounded so the plot sits above the
+    // tables and never eats the whole panel.
+    let height = ((n as f32) * 24.0 + 24.0).clamp(72.0, 240.0);
+
+    Plot::new("health_timeline")
+        .height(height)
+        .legend(Legend::default())
+        .y_axis_formatter(move |mark: GridMark, _range: &std::ops::RangeInclusive<f64>| {
+            // Only label integer lanes that exist; blank everything else so
+            // intermediate grid marks don't print bogus ids.
+            let v = mark.value;
+            if v.fract().abs() < 1e-6 && v >= 0.0 {
+                let idx = v as usize;
+                if idx < lane_ids.len() {
+                    return format!("0x{:X}", lane_ids[idx]);
                 }
-            };
-
-            ui.horizontal(|ui| {
-                ui.label(format!("rules: {}", report.rules.len()));
-                ui.separator();
-                ui.label(format!("total violations: {}", report.total_violations));
-                ui.separator();
-                ui.label(if report.all_ok { "all ok ✓" } else { "violations ✗" });
-            });
-
-            // --- Per-rule summary table ------------------------------------
-            ui.add_space(4.0);
-            ui.strong("Rules");
-            TableBuilder::new(ui)
-                .id_salt("health_rule_table")
-                .striped(true)
-                .resizable(true)
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::remainder())
-                .header(20.0, |mut header| {
-                    for h in ["id", "name", "expected_dt", "ok", "missing", "excessive", "no_data"]
-                    {
-                        header.col(|ui| {
-                            ui.strong(h);
-                        });
-                    }
-                })
-                .body(|mut body| {
-                    for rr in &report.rules {
-                        body.row(18.0, |mut row| {
-                            row.col(|ui| {
-                                ui.monospace(format!("0x{:X}", rr.can_id));
-                            });
-                            row.col(|ui| {
-                                ui.monospace(&rr.name);
-                            });
-                            row.col(|ui| {
-                                ui.monospace(format!("{:.6}", rr.expected_dt));
-                            });
-                            row.col(|ui| {
-                                ui.monospace(if rr.ok { "✓" } else { "✗" });
-                            });
-                            row.col(|ui| {
-                                ui.monospace(rr.missing.to_string());
-                            });
-                            row.col(|ui| {
-                                ui.monospace(rr.excessive.to_string());
-                            });
-                            row.col(|ui| {
-                                ui.monospace(if rr.no_data { "✗" } else { "—" });
-                            });
-                        });
-                    }
-                });
-
-            // --- Violations table (capped) ---------------------------------
-            ui.add_space(8.0);
-            ui.strong("Violations");
-            // Flatten the per-rule violations into one ordered list, then cap it.
-            let all: Vec<&slipstream_core::health::Violation> =
-                report.rules.iter().flat_map(|rr| rr.violations.iter()).collect();
-            let shown = all.len().min(HEALTH_VIOLATION_LIMIT);
-            if all.len() > HEALTH_VIOLATION_LIMIT {
-                ui.label(format!(
-                    "showing first {shown} of {} violations (truncated)",
-                    all.len()
-                ));
-            } else {
-                ui.label(format!("{} violations", all.len()));
             }
-            TableBuilder::new(ui)
-                .id_salt("health_violation_table")
-                .striped(true)
-                .resizable(true)
-                // Bounded + shrink-to-content so this virtualized table sits
-                // inside the collapsing section instead of trying to fill it.
-                .auto_shrink([false, true])
-                .max_scroll_height(180.0)
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::remainder())
-                .header(20.0, |mut header| {
-                    for h in ["id", "kind", "t_start", "t_end", "observed_dt", "expected_dt"] {
-                        header.col(|ui| {
-                            ui.strong(h);
-                        });
-                    }
-                })
-                .body(|body| {
-                    body.rows(18.0, shown, |mut row| {
-                        let v = all[row.index()];
-                        row.col(|ui| {
-                            ui.monospace(format!("0x{:X}", v.can_id));
-                        });
-                        row.col(|ui| {
-                            ui.monospace(format!("{:?}", v.kind));
-                        });
-                        row.col(|ui| {
-                            ui.monospace(format!("{:.4}", v.t_start));
-                        });
-                        row.col(|ui| {
-                            ui.monospace(format!("{:.4}", v.t_end));
-                        });
-                        row.col(|ui| {
-                            ui.monospace(format!("{:.6}", v.observed_dt));
-                        });
-                        row.col(|ui| {
-                            ui.monospace(format!("{:.6}", v.expected_dt));
-                        });
+            String::new()
+        })
+        .show(ui, |pui| {
+            for (idx, rr) in report.rules.iter().enumerate() {
+                // Present span: look up this rule's id in the memoized stats.
+                if let Some(m) = msgs.iter().find(|m| m.can_id == rr.can_id) {
+                    pui.polygon(
+                        Polygon::new(PlotPoints::from(rect(m.first_t, m.last_t, idx, 0.3)))
+                            .fill_color(green)
+                            .stroke(egui::Stroke::NONE)
+                            .allow_hover(false),
+                    );
+                }
+                // Violation spans on top, slightly taller so they read clearly.
+                for v in &rr.violations {
+                    pui.polygon(
+                        Polygon::new(PlotPoints::from(rect(v.t_start, v.t_end, idx, 0.35)))
+                            .fill_color(red)
+                            .stroke(egui::Stroke::NONE)
+                            .allow_hover(false),
+                    );
+                }
+            }
+        });
+}
+
+/// Maximum number of violation rows the violations table will display, to keep
+/// the per-frame rebuild cheap even when a log has very many violations.
+const HEALTH_VIOLATION_LIMIT: usize = 500;
+
+/// Health-results section (CENTER of the Health tab). Thin view: it displays the
+/// memoized [`HealthReport`] passed in — the per-rule summary table, a (capped)
+/// list of individual violations, and the CSV export. It does NOT run the health
+/// query itself (that happens in [`AnalysisCache::refresh`]); the
+/// tolerance/manual-rule controls live in the tab's left side panel.
+fn health_results(
+    ui: &mut egui::Ui,
+    report: Option<&HealthReport>,
+    rules: &HealthRuleSet,
+    export_status: &mut Option<String>,
+    session: &Session,
+) {
+    // Use the memoized report (built from the DBC + manual rules in
+    // `AnalysisCache::refresh`). `None` means no rules are defined yet.
+    let report = match report {
+        Some(r) => r,
+        None => {
+            ui.label("Load a DBC in Setup or add a manual rule to derive cycle rules.");
+            return;
+        }
+    };
+
+    ui.horizontal(|ui| {
+        ui.label(format!("rules: {}", report.rules.len()));
+        ui.separator();
+        ui.label(format!("total violations: {}", report.total_violations));
+        ui.separator();
+        ui.label(if report.all_ok { "all ok ✓" } else { "violations ✗" });
+    });
+
+    // Export the health report to CSV via the core exporter.
+    ui.horizontal(|ui| {
+        if ui.button("Export health (CSV)…").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("CSV", &["csv"])
+                .save_file()
+            {
+                *export_status = Some(match session.export_health_csv(rules, &path) {
+                    Ok(n) => format!(
+                        "Exported {n} health rows to {}",
+                        basename(&path.display().to_string())
+                    ),
+                    Err(e) => format!("Export failed: {e}"),
+                });
+            }
+        }
+        if let Some(status) = export_status.as_deref() {
+            ui.label(status);
+        }
+    });
+
+    // --- Per-rule summary table ------------------------------------
+    ui.add_space(4.0);
+    ui.strong("Rules");
+    TableBuilder::new(ui)
+        .id_salt("health_rule_table")
+        .striped(true)
+        .resizable(true)
+        .auto_shrink([false, true])
+        .max_scroll_height(220.0)
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::remainder())
+        .header(20.0, |mut header| {
+            for h in ["id", "name", "expected_dt", "ok", "missing", "excessive", "no_data"]
+            {
+                header.col(|ui| {
+                    ui.strong(h);
+                });
+            }
+        })
+        .body(|mut body| {
+            for rr in &report.rules {
+                body.row(18.0, |mut row| {
+                    row.col(|ui| {
+                        ui.monospace(format!("0x{:X}", rr.can_id));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(&rr.name);
+                    });
+                    row.col(|ui| {
+                        ui.monospace(format!("{:.6}", rr.expected_dt));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(if rr.ok { "✓" } else { "✗" });
+                    });
+                    row.col(|ui| {
+                        ui.monospace(rr.missing.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.monospace(rr.excessive.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.monospace(if rr.no_data { "✗" } else { "—" });
                     });
                 });
+            }
+        });
+
+    // --- Violations table (capped) ---------------------------------
+    ui.add_space(8.0);
+    ui.strong("Violations");
+    // Flatten the per-rule violations into one ordered list, then cap it.
+    let all: Vec<&slipstream_core::health::Violation> =
+        report.rules.iter().flat_map(|rr| rr.violations.iter()).collect();
+    let shown = all.len().min(HEALTH_VIOLATION_LIMIT);
+    if all.len() > HEALTH_VIOLATION_LIMIT {
+        ui.label(format!(
+            "showing first {shown} of {} violations (truncated)",
+            all.len()
+        ));
+    } else {
+        ui.label(format!("{} violations", all.len()));
+    }
+    // Last widget in the panel: let this virtualized table fill the remaining
+    // height (no `auto_shrink`/`max_scroll_height` cap) so it doesn't overlap.
+    TableBuilder::new(ui)
+        .id_salt("health_violation_table")
+        .striped(true)
+        .resizable(true)
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::auto())
+        .column(Column::remainder())
+        .header(20.0, |mut header| {
+            for h in ["id", "kind", "t_start", "t_end", "observed_dt", "expected_dt"] {
+                header.col(|ui| {
+                    ui.strong(h);
+                });
+            }
+        })
+        .body(|body| {
+            body.rows(18.0, shown, |mut row| {
+                let v = all[row.index()];
+                row.col(|ui| {
+                    ui.monospace(format!("0x{:X}", v.can_id));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:?}", v.kind));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.4}", v.t_start));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.4}", v.t_end));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.6}", v.observed_dt));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.6}", v.expected_dt));
+                });
+            });
         });
 }
 
@@ -1089,7 +1293,7 @@ fn health_section(
 /// per-frame rebuild cheap even when a log spans very many windows/channels.
 const BUS_LOAD_ROW_LIMIT: usize = 500;
 
-/// Bus-load section of the Analysis tab (collapsing). Thin view: it renders the
+/// Bus-load section of the Trace tab (collapsing). Thin view: it renders the
 /// bitrate/window inputs (which only mutate App state — the [`AnalysisCache`]
 /// recomputes the bus load next frame) and displays the memoized `points`
 /// passed in, one row per (channel, window) with its on-wire load percentage.
@@ -1119,7 +1323,7 @@ fn bus_load_section(
             });
 
             if points.is_empty() {
-                ui.label("No frames to compute bus load (load a log in Config).");
+                ui.label("No frames to compute bus load (load a log in Setup).");
                 return;
             }
 
@@ -1172,9 +1376,11 @@ fn bus_load_section(
         });
 }
 
-/// Graph tab — signal tree, decimated plot, and a per-signal stats strip.
+/// Graphics tab — signal tree, decimated plot, and a per-signal stats strip.
+/// LEFT side panel groups signals by message name as collapsing headers and
+/// holds the normalize toggle + CSV export; CENTER is the egui_plot.
 #[allow(clippy::too_many_arguments)]
-fn graph_tab(
+fn graphics_tab(
     ctx: &egui::Context,
     session: &Session,
     data_epoch: u64,
@@ -1189,28 +1395,78 @@ fn graph_tab(
     // Effective decimation window: the range we captured from the plot last
     // frame (so zooming in fetches finer detail), falling back to the whole log.
     let (t_start, t_end) = plot_x_range.unwrap_or((0.0, session.duration()));
-    // --- Signal tree -------------------------------------------------------
+    // --- Signal tree (grouped by message) ----------------------------------
     egui::SidePanel::left("signals")
         .resizable(true)
-        .default_width(220.0)
+        .default_width(260.0)
         .show(ctx, |ui| {
             ui.heading("Signals");
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for s in signals.iter() {
-                    let mut on = selected.contains(&s.name);
-                    let label = if s.unit.is_empty() {
-                        format!("{} ({})", s.name, s.message)
-                    } else {
-                        format!("{} [{}] ({})", s.name, s.unit, s.message)
-                    };
-                    if ui.checkbox(&mut on, label).changed() {
-                        if on {
-                            selected.insert(s.name.clone());
-                        } else {
-                            selected.remove(&s.name);
+
+            // Normalize toggle: a stand-in for multi-Y-axis (egui_plot is single-Y).
+            ui.checkbox(plot_normalize, "Normalize (0..1 per signal)");
+
+            // Export the first selected signal's decoded series to CSV. Disabled
+            // until at least one signal is selected (the core call needs a name).
+            ui.add_enabled_ui(!selected.is_empty(), |ui| {
+                if ui.button("Export signal (CSV)…").clicked() {
+                    if let Some(name) = selected.iter().next() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .save_file()
+                        {
+                            *export_status = Some(match session.export_signal_csv(name, &path) {
+                                Ok(n) => format!(
+                                    "Exported {n} samples of {name} to {}",
+                                    basename(&path.display().to_string())
+                                ),
+                                Err(e) => format!("Export failed: {e}"),
+                            });
                         }
                     }
+                }
+            });
+            if let Some(status) = export_status.as_deref() {
+                ui.label(status);
+            }
+            ui.separator();
+
+            // Group signal checkboxes under a collapsing header per message name.
+            // `available_signals` returns rows ordered by message then signal, so
+            // consecutive entries with the same message belong together; we open a
+            // new header whenever the message name changes.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let mut i = 0;
+                while i < signals.len() {
+                    let message = signals[i].message.clone();
+                    let end = signals[i..]
+                        .iter()
+                        .position(|s| s.message != message)
+                        .map_or(signals.len(), |off| i + off);
+                    egui::CollapsingHeader::new(if message.is_empty() {
+                        "(no message)"
+                    } else {
+                        &message
+                    })
+                    .default_open(true)
+                    .id_salt(("sig_group", i))
+                    .show(ui, |ui| {
+                        for s in &signals[i..end] {
+                            let mut on = selected.contains(&s.name);
+                            let label = if s.unit.is_empty() {
+                                s.name.clone()
+                            } else {
+                                format!("{} [{}]", s.name, s.unit)
+                            };
+                            if ui.checkbox(&mut on, label).changed() {
+                                if on {
+                                    selected.insert(s.name.clone());
+                                } else {
+                                    selected.remove(&s.name);
+                                }
+                            }
+                        }
+                    });
+                    i = end;
                 }
             });
         });
@@ -1218,10 +1474,10 @@ fn graph_tab(
     // --- Plot --------------------------------------------------------------
     egui::CentralPanel::default().show(ctx, |ui| {
         // Empty state: no decodable signals means no DBC is loaded (or it decodes
-        // nothing), so point at Config rather than the generic select-a-signal hint.
+        // nothing), so point at Setup rather than the generic select-a-signal hint.
         if signals.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("No decodable signals. Load a DBC in the Config tab.");
+                ui.label("No decodable signals. Load a DBC in the Setup tab.");
             });
             return;
         }
@@ -1247,39 +1503,6 @@ fn graph_tab(
                     ));
                     ui.separator();
                 }
-            }
-        });
-
-        // Export the first selected signal's decoded series to CSV. The button
-        // is only reachable here (the panel returns early when nothing is
-        // selected), so at least one signal is always available.
-        ui.horizontal(|ui| {
-            if ui.button("Export signal (CSV)…").clicked() {
-                if let Some(name) = selected.iter().next() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("CSV", &["csv"])
-                        .save_file()
-                    {
-                        *export_status = Some(match session.export_signal_csv(name, &path) {
-                            Ok(n) => format!(
-                                "Exported {n} samples of {name} to {}",
-                                basename(&path.display().to_string())
-                            ),
-                            Err(e) => format!("Export failed: {e}"),
-                        });
-                    }
-                }
-            }
-            if let Some(status) = export_status.as_deref() {
-                ui.label(status);
-            }
-        });
-
-        // Normalize toggle: a stand-in for multi-Y-axis (egui_plot is single-Y).
-        ui.horizontal(|ui| {
-            ui.checkbox(plot_normalize, "Normalize (0..1 per signal)");
-            if *plot_normalize {
-                ui.label("— normalized view: each signal scaled by its own min/max");
             }
         });
 
@@ -1355,40 +1578,43 @@ fn graph_tab(
     });
 }
 
-/// Diff tab — compare two loaded logs by CAN id. Thin view: it picks two log
-/// ids from [`Session::list_logs`] and renders [`Session::diff_logs`] as a table
-/// (per-id presence, counts, count delta, and mean inter-arrival times).
+/// Diff tab — compare two loaded logs by CAN id. Thin view: the LEFT side panel
+/// picks two log ids from [`Session::list_logs`]; the CENTER renders
+/// [`Session::diff_logs`] as a table (per-id presence, counts, count delta, and
+/// mean inter-arrival times).
 fn diff_tab(
     ctx: &egui::Context,
     session: &Session,
     diff_a: &mut Option<u32>,
     diff_b: &mut Option<u32>,
 ) {
-    egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading("Diff");
-        ui.separator();
+    let logs = session.list_logs();
 
-        let logs = session.list_logs();
-        if logs.len() < 2 {
-            ui.label("Load at least two logs in Config to diff.");
-            return;
+    // Label a log by its path basename, falling back to its id.
+    let label_for = |id: u32| -> String {
+        logs.iter()
+            .find(|l| l.id == id)
+            .map(|l| basename(&l.path).to_string())
+            .unwrap_or_else(|| format!("log {id}"))
+    };
+    let selected_text = |sel: &Option<u32>| -> String {
+        match sel {
+            Some(id) => label_for(*id),
+            None => "—".to_string(),
         }
+    };
 
-        // Label a log by its path basename, falling back to its id.
-        let label_for = |id: u32| -> String {
-            logs.iter()
-                .find(|l| l.id == id)
-                .map(|l| basename(&l.path).to_string())
-                .unwrap_or_else(|| format!("log {id}"))
-        };
-        let selected_text = |sel: &Option<u32>| -> String {
-            match sel {
-                Some(id) => label_for(*id),
-                None => "—".to_string(),
+    // --- LEFT: log pickers -------------------------------------------------
+    egui::SidePanel::left("diff_controls")
+        .resizable(true)
+        .default_width(260.0)
+        .show(ctx, |ui| {
+            ui.heading("Diff");
+            ui.separator();
+            if logs.len() < 2 {
+                ui.label("Load at least two logs in Setup to diff.");
+                return;
             }
-        };
-
-        ui.horizontal(|ui| {
             ui.label("Log A:");
             egui::ComboBox::from_id_salt("diff_log_a")
                 .selected_text(selected_text(diff_a))
@@ -1397,7 +1623,6 @@ fn diff_tab(
                         ui.selectable_value(diff_a, Some(l.id), basename(&l.path));
                     }
                 });
-            ui.separator();
             ui.label("Log B:");
             egui::ComboBox::from_id_salt("diff_log_b")
                 .selected_text(selected_text(diff_b))
@@ -1407,12 +1632,20 @@ fn diff_tab(
                     }
                 });
         });
-        ui.separator();
+
+    // --- CENTER: diff table ------------------------------------------------
+    egui::CentralPanel::default().show(ctx, |ui| {
+        if logs.len() < 2 {
+            ui.centered_and_justified(|ui| {
+                ui.label("Load at least two logs in Setup to diff.");
+            });
+            return;
+        }
 
         let (a, b) = match (*diff_a, *diff_b) {
             (Some(a), Some(b)) => (a, b),
             _ => {
-                ui.label("Pick a log for both A and B.");
+                ui.label("Pick a log for both A and B on the left.");
                 return;
             }
         };
