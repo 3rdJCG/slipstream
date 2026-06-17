@@ -13,6 +13,29 @@ use serde::{Deserialize, Serialize};
 use crate::predicate::Predicate;
 use crate::{Error, Result};
 
+/// How much an observed inter-arrival time may deviate from the expected
+/// cadence before it counts as a violation. Specified either as a fraction of
+/// the expected interval or as an absolute number of seconds.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum Tolerance {
+    /// Fractional tolerance, e.g. `0.3` = ±30% of `expected_dt`.
+    Percent(f64),
+    /// Absolute tolerance, ±this many seconds around `expected_dt`.
+    AbsSeconds(f64),
+}
+
+impl Tolerance {
+    /// The accepted `(lo, hi)` inter-arrival bounds around `expected_dt`
+    /// (seconds). A gap below `lo` is [`ViolationKind::Excessive`], above `hi`
+    /// is [`ViolationKind::Missing`].
+    pub fn bounds(self, expected_dt: f64) -> (f64, f64) {
+        match self {
+            Tolerance::Percent(frac) => (expected_dt * (1.0 - frac), expected_dt * (1.0 + frac)),
+            Tolerance::AbsSeconds(secs) => (expected_dt - secs, expected_dt + secs),
+        }
+    }
+}
+
 /// Expected cadence of one CAN id, optionally gated by a [`Predicate`] (e.g.
 /// "ignition ON"). The rule is only evaluated where its gate is active.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,8 +45,8 @@ pub struct HealthRule {
     pub name: String,
     /// Expected inter-arrival time, seconds.
     pub expected_dt: f64,
-    /// Fractional tolerance, e.g. 0.2 = ±20%.
-    pub tolerance: f64,
+    /// Permitted deviation from `expected_dt` (percent or absolute seconds).
+    pub tolerance: Tolerance,
     /// When to apply the rule. Defaults to [`Predicate::Always`].
     #[serde(default)]
     pub gate: Predicate,
@@ -102,15 +125,20 @@ impl HealthRuleSet {
 }
 
 /// Pure cadence check: given time-ordered arrival `times` of `can_id`, report
-/// intervals whose gap falls outside `expected_dt * (1 ± tol)`. Returns empty
-/// for fewer than two samples (the caller decides whether that is `NoData`).
-pub fn scan_cadence(can_id: u32, times: &[f64], expected_dt: f64, tol: f64) -> Vec<Violation> {
+/// intervals whose gap falls outside the `(lo, hi)` bounds that `tol` derives
+/// from `expected_dt`. Returns empty for fewer than two samples (the caller
+/// decides whether that is `NoData`).
+pub fn scan_cadence(
+    can_id: u32,
+    times: &[f64],
+    expected_dt: f64,
+    tol: Tolerance,
+) -> Vec<Violation> {
     let mut out = Vec::new();
     if times.len() < 2 || expected_dt <= 0.0 {
         return out;
     }
-    let hi = expected_dt * (1.0 + tol);
-    let lo = expected_dt * (1.0 - tol);
+    let (lo, hi) = tol.bounds(expected_dt);
     for w in times.windows(2) {
         let dt = w[1] - w[0];
         let kind = if dt > hi {
@@ -139,14 +167,14 @@ mod tests {
     #[test]
     fn regular_cadence_has_no_violations() {
         let times: Vec<f64> = (0..10).map(|i| i as f64 * 1.0).collect();
-        assert!(scan_cadence(1, &times, 1.0, 0.1).is_empty());
+        assert!(scan_cadence(1, &times, 1.0, Tolerance::Percent(0.1)).is_empty());
     }
 
     #[test]
     fn detects_missing_gap() {
         // 0,1,2 then a jump to 6 (gap of 4 >> 1).
         let times = [0.0, 1.0, 2.0, 6.0];
-        let v = scan_cadence(0x10, &times, 1.0, 0.2);
+        let v = scan_cadence(0x10, &times, 1.0, Tolerance::Percent(0.2));
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ViolationKind::Missing);
         assert_eq!(v[0].can_id, 0x10);
@@ -158,9 +186,22 @@ mod tests {
     fn detects_excessive_burst() {
         // a too-fast pair (0.1 << 1).
         let times = [0.0, 1.0, 1.1, 2.1];
-        let v = scan_cadence(1, &times, 1.0, 0.2);
+        let v = scan_cadence(1, &times, 1.0, Tolerance::Percent(0.2));
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ViolationKind::Excessive);
+    }
+
+    #[test]
+    fn abs_seconds_tolerance_uses_fixed_window() {
+        // ±50 ms around a 100 ms cadence ⇒ accept [50ms, 150ms].
+        let tol = Tolerance::AbsSeconds(0.05);
+        let (lo, hi) = tol.bounds(0.1);
+        assert!((lo - 0.05).abs() < 1e-12 && (hi - 0.15).abs() < 1e-12);
+        // 0,0.1,0.2 are fine; a jump to 0.4 (gap 0.2 > 0.15) is Missing.
+        let times = [0.0, 0.1, 0.2, 0.4];
+        let v = scan_cadence(7, &times, 0.1, tol);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ViolationKind::Missing);
     }
 
     #[test]
@@ -170,7 +211,7 @@ mod tests {
                 can_id: 0x100,
                 name: "EngineData".into(),
                 expected_dt: 0.01,
-                tolerance: 0.2,
+                tolerance: Tolerance::Percent(0.2),
                 gate: Predicate::Signal {
                     signal: "Ignition".into(),
                     op: crate::predicate::Compare::Ge,

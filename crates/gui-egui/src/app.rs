@@ -42,8 +42,20 @@ pub struct App {
     /// Inclusive time-range bounds as text; empty = open bound.
     filter_t_start: String,
     filter_t_end: String,
-    /// Fractional cadence tolerance for DBC-derived health rules (e.g. 0.3 = ±30%).
-    health_tolerance: f64,
+    /// When `true`, the health tolerance is absolute milliseconds; otherwise it
+    /// is a fraction (percent) of the expected cadence.
+    health_tol_abs: bool,
+    /// Tolerance value: a fraction (e.g. `0.3` = ±30%) when `health_tol_abs` is
+    /// false, or milliseconds when it is true.
+    health_tol_value: f64,
+    /// Manual health rules `(can_id, expected_ms)` added in the Analysis tab for
+    /// frames the DBC doesn't declare a cycle time for. They reuse the tolerance
+    /// above and an `Always` gate.
+    manual_rules: Vec<(u32, f64)>,
+    /// Hex CAN id text for the "add manual rule" form.
+    new_rule_id: String,
+    /// Expected-period-in-ms text for the "add manual rule" form.
+    new_rule_ms: String,
     /// Channels selected in the Analysis-tab filter; empty = all channels.
     channel_filter: BTreeSet<u8>,
     /// Bus-load nominal bitrate in bits/s (Analysis tab).
@@ -79,7 +91,11 @@ impl App {
             filter_id: String::new(),
             filter_t_start: String::new(),
             filter_t_end: String::new(),
-            health_tolerance: 0.3,
+            health_tol_abs: false,
+            health_tol_value: 0.3,
+            manual_rules: Vec::new(),
+            new_rule_id: String::new(),
+            new_rule_ms: String::new(),
             channel_filter: BTreeSet::new(),
             bus_bitrate: 500_000,
             bus_window: 1.0,
@@ -106,7 +122,11 @@ impl eframe::App for App {
             filter_id,
             filter_t_start,
             filter_t_end,
-            health_tolerance,
+            health_tol_abs,
+            health_tol_value,
+            manual_rules,
+            new_rule_id,
+            new_rule_ms,
             channel_filter,
             bus_bitrate,
             bus_window,
@@ -134,7 +154,11 @@ impl eframe::App for App {
                 filter_id,
                 filter_t_start,
                 filter_t_end,
-                health_tolerance,
+                health_tol_abs,
+                health_tol_value,
+                manual_rules,
+                new_rule_id,
+                new_rule_ms,
                 channel_filter,
                 bus_bitrate,
                 bus_window,
@@ -375,7 +399,11 @@ fn analysis_tab(
     filter_id: &mut String,
     filter_t_start: &mut String,
     filter_t_end: &mut String,
-    health_tolerance: &mut f64,
+    health_tol_abs: &mut bool,
+    health_tol_value: &mut f64,
+    manual_rules: &mut Vec<(u32, f64)>,
+    new_rule_id: &mut String,
+    new_rule_ms: &mut String,
     channel_filter: &mut BTreeSet<u8>,
     bus_bitrate: &mut u32,
     bus_window: &mut f64,
@@ -527,7 +555,15 @@ fn analysis_tab(
         // Render the health section (bounded content) BEFORE the frame table:
         // the frame table is virtualized and fills remaining height, so it must
         // be the last widget in the panel or it overlaps what follows.
-        health_section(ui, session, health_tolerance);
+        health_section(
+            ui,
+            session,
+            health_tol_abs,
+            health_tol_value,
+            manual_rules,
+            new_rule_id,
+            new_rule_ms,
+        );
         ui.separator();
 
         // Bus load is also bounded content; keep it BEFORE the frame table so the
@@ -601,24 +637,121 @@ const HEALTH_VIOLATION_LIMIT: usize = 500;
 /// rules from the DBC via [`Session::dbc_health_rules`] and runs
 /// [`Session::health_report`] each frame (cheap enough for the demo), then shows
 /// a per-rule summary plus a (capped) list of individual violations.
-fn health_section(ui: &mut egui::Ui, session: &Session, health_tolerance: &mut f64) {
+#[allow(clippy::too_many_arguments)]
+fn health_section(
+    ui: &mut egui::Ui,
+    session: &Session,
+    health_tol_abs: &mut bool,
+    health_tol_value: &mut f64,
+    manual_rules: &mut Vec<(u32, f64)>,
+    new_rule_id: &mut String,
+    new_rule_ms: &mut String,
+) {
+    use slipstream_core::health::{HealthRule, Tolerance};
+    use slipstream_core::predicate::Predicate;
+
     egui::CollapsingHeader::new("Health (frame cadence)")
         .default_open(false)
         .show(ui, |ui| {
+            // --- Tolerance mode + value -----------------------------------
             ui.horizontal(|ui| {
-                ui.label("Tolerance (±):");
-                ui.add(
-                    egui::Slider::new(health_tolerance, 0.0..=1.0)
-                        .fixed_decimals(2)
-                        .clamping(egui::SliderClamping::Always),
-                );
+                ui.label("Tolerance:");
+                egui::ComboBox::from_id_salt("health_tol_mode")
+                    .selected_text(if *health_tol_abs { "Abs (ms)" } else { "Percent" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(health_tol_abs, false, "Percent");
+                        ui.selectable_value(health_tol_abs, true, "Abs (ms)");
+                    });
+                // Percent edits the fraction directly; Abs edits milliseconds.
+                if *health_tol_abs {
+                    ui.add(
+                        egui::DragValue::new(health_tol_value)
+                            .speed(1.0)
+                            .range(0.0..=f64::MAX)
+                            .suffix(" ms"),
+                    );
+                } else {
+                    ui.add(
+                        egui::DragValue::new(health_tol_value)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .fixed_decimals(2),
+                    );
+                }
             });
 
-            // Derive cadence rules from the DBC and run the report. Building +
-            // running each frame is fine for the demo; revisit if it gets heavy.
-            let rules = session.dbc_health_rules(*health_tolerance);
+            // Build the Tolerance from the mode + value (ms → seconds for Abs).
+            let tolerance = if *health_tol_abs {
+                Tolerance::AbsSeconds(*health_tol_value / 1000.0)
+            } else {
+                Tolerance::Percent(*health_tol_value)
+            };
+
+            // --- Manual rules (DBC-independent) ---------------------------
+            ui.add_space(4.0);
+            ui.strong("Manual rules");
+            ui.horizontal(|ui| {
+                ui.label("CAN id (hex):");
+                ui.add(egui::TextEdit::singleline(new_rule_id).desired_width(80.0));
+                ui.label("period (ms):");
+                ui.add(egui::TextEdit::singleline(new_rule_ms).desired_width(64.0));
+                if ui.button("Add").clicked() {
+                    if let (Some(id), Ok(ms)) =
+                        (parse_hex_id(new_rule_id), new_rule_ms.trim().parse::<f64>())
+                    {
+                        if ms > 0.0 {
+                            manual_rules.push((id, ms));
+                            new_rule_id.clear();
+                            new_rule_ms.clear();
+                        }
+                    }
+                }
+            });
+            // List current manual rules with a per-row remove button.
+            let mut rule_to_remove: Option<usize> = None;
+            for (i, (id, ms)) in manual_rules.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.button("✕").on_hover_text("Remove this rule").clicked() {
+                        rule_to_remove = Some(i);
+                    }
+                    ui.monospace(format!("0x{id:X}  every {ms} ms"));
+                });
+            }
+            if let Some(i) = rule_to_remove {
+                manual_rules.remove(i);
+            }
+
+            // --- Unknown frames (no DBC/rule) -----------------------------
+            ui.add_space(4.0);
+            let unknown = session.unknown_frame_ids();
+            ui.strong("Unknown frames (no DBC/rule)");
+            if unknown.is_empty() {
+                ui.label("—");
+            } else {
+                let list = unknown
+                    .iter()
+                    .map(|id| format!("0x{id:X}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.monospace(list);
+            }
+            ui.add_space(4.0);
+
+            // Derive cadence rules from the DBC and combine with the manual
+            // rules into one set. Building + running each frame is fine for the
+            // demo; revisit if it gets heavy.
+            let mut rules = session.dbc_health_rules(tolerance);
+            for &(can_id, expected_ms) in manual_rules.iter() {
+                rules.rules.push(HealthRule {
+                    can_id,
+                    name: format!("manual 0x{can_id:X}"),
+                    expected_dt: expected_ms / 1000.0,
+                    tolerance,
+                    gate: Predicate::Always,
+                });
+            }
             if rules.rules.is_empty() {
-                ui.label("Load a DBC in Config to derive cycle rules.");
+                ui.label("Load a DBC in Config or add a manual rule to derive cycle rules.");
                 return;
             }
             let report = session.health_report(&rules);

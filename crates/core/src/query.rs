@@ -517,6 +517,29 @@ impl Session {
         chs
     }
 
+    /// Distinct CAN ids present in the combined store that no loaded DBC
+    /// message defines — "unknown frames" with no DBC (and so no derived
+    /// cadence rule). Sorted ascending. Channel scoping is intentionally
+    /// ignored here: an id known to *any* loaded DBC is treated as known.
+    pub fn unknown_frame_ids(&self) -> Vec<u32> {
+        use std::collections::HashSet;
+        let known: HashSet<u32> = self
+            .dbcs
+            .iter()
+            .flat_map(|d| d.db.messages.iter().map(|m| m.can_id))
+            .collect();
+        let cols = self.store.columns();
+        let mut ids: Vec<u32> = cols
+            .can_id
+            .iter()
+            .copied()
+            .filter(|id| !known.contains(id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     // --- compat: replace-style loaders (older callers / tests) -------------
 
     /// Replace all DBCs with `dbc` (channel = all).
@@ -827,8 +850,12 @@ impl Session {
 
     /// Build default health rules from the DBC's `GenMsgCycleTime` attributes
     /// (one rule per message that declares a cycle time), with a shared
-    /// `tolerance`. Manual rules can be added on top.
-    pub fn dbc_health_rules(&self, tolerance: f64) -> crate::health::HealthRuleSet {
+    /// `tolerance` (percent or absolute seconds). Manual rules can be added on
+    /// top.
+    pub fn dbc_health_rules(
+        &self,
+        tolerance: crate::health::Tolerance,
+    ) -> crate::health::HealthRuleSet {
         use crate::health::HealthRule;
         let rules = self
             .dbcs
@@ -1260,14 +1287,14 @@ mod tests {
 
     #[test]
     fn health_demo_regular_is_clean() {
-        use crate::health::{HealthRule, HealthRuleSet};
+        use crate::health::{HealthRule, HealthRuleSet, Tolerance};
         let s = Session::demo();
         let set = HealthRuleSet {
             rules: vec![HealthRule {
                 can_id: 0x100,
                 name: "EngineData".into(),
                 expected_dt: 0.012,
-                tolerance: 0.5,
+                tolerance: Tolerance::Percent(0.5),
                 gate: Predicate::Always,
             }],
         };
@@ -1276,14 +1303,14 @@ mod tests {
 
     #[test]
     fn health_missing_id_is_nodata() {
-        use crate::health::{HealthRule, HealthRuleSet, ViolationKind};
+        use crate::health::{HealthRule, HealthRuleSet, Tolerance, ViolationKind};
         let s = Session::demo();
         let set = HealthRuleSet {
             rules: vec![HealthRule {
                 can_id: 0x999,
                 name: "Absent".into(),
                 expected_dt: 0.01,
-                tolerance: 0.2,
+                tolerance: Tolerance::Percent(0.2),
                 gate: Predicate::Always,
             }],
         };
@@ -1294,8 +1321,9 @@ mod tests {
 
     #[test]
     fn dbc_health_rules_built_from_cycle_time() {
+        use crate::health::Tolerance;
         let s = Session::demo();
-        let set = s.dbc_health_rules(0.3);
+        let set = s.dbc_health_rules(Tolerance::Percent(0.3));
         assert_eq!(set.rules.len(), 2); // both demo messages declare 12 ms
         assert!(set.rules.iter().all(|r| (r.expected_dt - 0.012).abs() < 1e-9));
         // The DBC-derived rules pass on the regular demo log.
@@ -1304,7 +1332,7 @@ mod tests {
 
     #[test]
     fn health_time_range_gate_excludes_frames() {
-        use crate::health::{HealthRule, HealthRuleSet, ViolationKind};
+        use crate::health::{HealthRule, HealthRuleSet, Tolerance, ViolationKind};
         let s = Session::demo();
         // Gate to an empty window ⇒ no frames considered ⇒ NoData.
         let set = HealthRuleSet {
@@ -1312,7 +1340,7 @@ mod tests {
                 can_id: 0x100,
                 name: "EngineData".into(),
                 expected_dt: 0.012,
-                tolerance: 0.5,
+                tolerance: Tolerance::Percent(0.5),
                 gate: Predicate::TimeRange {
                     t_start: 1000.0,
                     t_end: 2000.0,
@@ -1327,7 +1355,7 @@ mod tests {
     #[test]
     fn health_report_demo_dbc_rules_all_ok() {
         let s = Session::demo();
-        let report = s.health_report(&s.dbc_health_rules(0.5));
+        let report = s.health_report(&s.dbc_health_rules(crate::health::Tolerance::Percent(0.5)));
         assert!(report.all_ok);
         assert_eq!(report.total_violations, 0);
         assert_eq!(report.rules.len(), 2); // both demo messages declare a cycle
@@ -1340,7 +1368,7 @@ mod tests {
 
     #[test]
     fn health_report_tiny_expected_dt_flags_missing() {
-        use crate::health::{HealthRule, HealthRuleSet};
+        use crate::health::{HealthRule, HealthRuleSet, Tolerance};
         let s = Session::demo();
         // An unrealistically small expected cadence makes every real gap look
         // like a missing frame.
@@ -1349,7 +1377,7 @@ mod tests {
                 can_id: 0x100,
                 name: "EngineData".into(),
                 expected_dt: 0.0001,
-                tolerance: 0.5,
+                tolerance: Tolerance::Percent(0.5),
                 gate: Predicate::Always,
             }],
         };
@@ -1386,7 +1414,7 @@ mod tests {
 
     #[test]
     fn health_signal_gate_never_active_is_nodata() {
-        use crate::health::{HealthRule, HealthRuleSet, ViolationKind};
+        use crate::health::{HealthRule, HealthRuleSet, Tolerance, ViolationKind};
         use crate::predicate::{Compare, Predicate};
         let s = Session::demo();
         // Gate that never holds ⇒ no frames considered ⇒ NoData.
@@ -1395,7 +1423,7 @@ mod tests {
                 can_id: 0x100,
                 name: "EngineData".into(),
                 expected_dt: 0.012,
-                tolerance: 0.5,
+                tolerance: Tolerance::Percent(0.5),
                 gate: Predicate::Signal {
                     signal: "EngineSpeed".into(),
                     op: Compare::Gt,
@@ -1599,6 +1627,42 @@ mod tests {
 
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn unknown_frame_ids_demo_all_known() {
+        // Every demo id (0x100, 0x200) is defined in the demo DBC ⇒ none unknown.
+        let s = Session::demo();
+        assert!(s.unknown_frame_ids().is_empty());
+    }
+
+    #[test]
+    fn unknown_frame_ids_lists_ids_absent_from_dbc() {
+        // A session opened from an ASC (no DBC) ⇒ its ids are all unknown; and
+        // an id absent from a loaded DBC is still listed. ASC classic line:
+        // `<ts> <ch> <idhex> Rx d <dlc> <bytes...>`.
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let log = dir.join(format!("slipstream_unknown_{pid}.asc"));
+        let dbc = dir.join(format!("slipstream_unknown_{pid}.dbc"));
+        // 0x100 is in the DBC below; 0x321 (=801) is not.
+        std::fs::write(&log, "0.0 1 100 Rx d 1 11\n0.1 1 321 Rx d 1 22\n").unwrap();
+        std::fs::write(
+            &dbc,
+            "VERSION \"\"\n\nBO_ 256 EngineData: 8 ECU\n SG_ Rpm : 0|16@1+ (0.25,0) [0|16383] \"rpm\" Vector__XXX\n",
+        )
+        .unwrap();
+
+        // No DBC: both ids are unknown, sorted ascending.
+        let mut s = Session::open(&log).unwrap();
+        assert_eq!(s.unknown_frame_ids(), vec![0x100, 0x321]);
+
+        // With a DBC defining 0x100, only 0x321 remains unknown.
+        s.add_dbc(&dbc, None).unwrap();
+        assert_eq!(s.unknown_frame_ids(), vec![0x321]);
+
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&dbc);
     }
 
     #[test]

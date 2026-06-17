@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn export_health_csv_header_and_violations() {
-        use crate::health::{HealthRule, HealthRuleSet};
+        use crate::health::{HealthRule, HealthRuleSet, Tolerance};
         use crate::predicate::Predicate;
         let s = Session::demo();
         // An unrealistically tight cadence flags every real gap as missing.
@@ -161,7 +161,7 @@ mod tests {
                 can_id: 0x100,
                 name: "EngineData".into(),
                 expected_dt: 0.0001,
-                tolerance: 0.5,
+                tolerance: Tolerance::Percent(0.5),
                 gate: Predicate::Always,
             }],
         };

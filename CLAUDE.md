@@ -108,13 +108,14 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [ ] 周期判定は **`(can_id, channel)` 単位**で行う
 - [x] DBC の周期属性（`GenMsgCycleTime` 等）を読み、フレームごとの期待周期を取得（`DbcMessage.expected_cycle_ms` / `Session::dbc_health_rules`）
 - [x] 実測周期の検査（違反区間を列挙。core: `health::scan_cadence` + `Session::check_health` → Missing=gap過大 / Excessive=gap過小 / NoData。欠落と遅延の細分はまだ）
-- [ ] 許容差は**絶対値（ms）と百分率（%）の両方**で指定可能にする
-- [ ] DBC 未定義フレーム向けの手動ルール追加（対象 ID/名・期待周期・許容差を UI で設定）
+- [x] 許容差は**絶対値（ms）と百分率（%）の両方**で指定可能にする（`health::Tolerance::Percent`/`AbsSeconds` + `bounds`。`scan_cadence`/`dbc_health_rules` が `Tolerance` を受ける）
+- [x] DBC 未定義フレーム向けの手動ルール追加（対象 ID/名・期待周期・許容差を UI で設定）
 - [ ] **ゲート条件**：チェックを有効化する前提条件（上記「述語エンジン」を使用）。
       例：電源を表すシグナル値が ON の区間だけ周期チェックする等。複数条件を AND/OR で組める
 - [ ] ゲート信号のチャタリング対策（ヒステリシス / デバウンス）
 - [ ] ログ端のグレース（最初の出現前・最後の出現後は欠落と見なさない）
-- [ ] DBC・手動ルールいずれにも該当しない ID を「未知フレーム」として一覧
+      — メモ: 設計上すでに満たされている。`scan_cadence` は観測フレーム間の gap のみ測るため、先頭出現前・末尾出現後の不在は欠落（Missing）にならない（変更不要）。
+- [x] DBC・手動ルールいずれにも該当しない ID を「未知フレーム」として一覧（`Session::unknown_frame_ids` — どの DBC メッセージにも無い distinct can_id を昇順で返す）
 - [x] 結果スキーマ：RPC 形式の `HealthReport` 型（違反フレーム・違反区間・周期統計）を定義
 - [x] チェック結果を Analysis タブに表示（違反一覧 + 違反区間。行テーブルと連動）
 - [x] 健全性ルールセットの保存 / 読み込み（core: `health::HealthRuleSet::save/load`、JSON。手動ルール + ゲートを 1 セットで永続化）
