@@ -39,6 +39,9 @@ pub struct App {
     // --- Config tab state --------------------------------------------------
     /// Last load error (log or DBC), shown in the Config tab; `None` = no error.
     config_error: Option<String>,
+    /// Last CSV-export result (success row count or error), shown in the
+    /// Analysis/Graph tabs; `None` = nothing exported yet this session.
+    export_status: Option<String>,
 }
 
 impl App {
@@ -58,6 +61,7 @@ impl App {
             health_tolerance: 0.3,
             channel_filter: BTreeSet::new(),
             config_error: None,
+            export_status: None,
         }
     }
 }
@@ -78,6 +82,7 @@ impl eframe::App for App {
             health_tolerance,
             channel_filter,
             config_error,
+            export_status,
         } = self;
 
         // --- Tab bar -------------------------------------------------------
@@ -99,8 +104,17 @@ impl eframe::App for App {
                 filter_t_end,
                 health_tolerance,
                 channel_filter,
+                export_status,
             ),
-            Tab::Graph => graph_tab(ctx, session, signals, selected, *t_start, *t_end),
+            Tab::Graph => graph_tab(
+                ctx,
+                session,
+                signals,
+                selected,
+                *t_start,
+                *t_end,
+                export_status,
+            ),
         }
     }
 }
@@ -294,6 +308,7 @@ fn analysis_tab(
     filter_t_end: &mut String,
     health_tolerance: &mut f64,
     channel_filter: &mut BTreeSet<u8>,
+    export_status: &mut Option<String>,
 ) {
     // Build a FrameFilter from the (lenient) text inputs. Unparseable fields are
     // simply treated as "no constraint", so a default filter matches all rows.
@@ -311,15 +326,26 @@ fn analysis_tab(
         || filter.t_end.is_some()
         || !filter.channels.is_empty();
 
-    // --- Cycle stats (bottom strip) ----------------------------------------
-    egui::TopBottomPanel::bottom("cycle_stats")
+    // --- Messages (bottom strip) -------------------------------------------
+    // One per-id row, merging presence stats (count, mean_dt from
+    // `message_stats`) with cadence jitter (from `all_cycle_stats`). Both are
+    // sorted ascending by can_id; we index the cycle stats by id so ids with a
+    // single frame (no cadence) still appear, with a blank jitter.
+    egui::TopBottomPanel::bottom("message_stats")
         .resizable(true)
         .default_height(200.0)
         .show(ctx, |ui| {
-            ui.heading("Cycle stats");
-            let stats = session.all_cycle_stats();
+            ui.heading("Messages");
+            let msgs = session.message_stats();
+            let cycles = session.all_cycle_stats();
+            let jitter_of = |id: u32| -> Option<f64> {
+                cycles
+                    .iter()
+                    .find(|cs| cs.can_id == id)
+                    .map(|cs| cs.jitter)
+            };
             TableBuilder::new(ui)
-                .id_salt("cycle_stats_table")
+                .id_salt("message_stats_table")
                 .striped(true)
                 .resizable(true)
                 .column(Column::auto())
@@ -341,19 +367,25 @@ fn analysis_tab(
                     });
                 })
                 .body(|mut body| {
-                    for cs in &stats {
+                    for m in &msgs {
                         body.row(18.0, |mut row| {
                             row.col(|ui| {
-                                ui.monospace(format!("0x{:X}", cs.can_id));
+                                ui.monospace(format!("0x{:X}", m.can_id));
                             });
                             row.col(|ui| {
-                                ui.monospace(cs.count.to_string());
+                                ui.monospace(m.count.to_string());
                             });
                             row.col(|ui| {
-                                ui.monospace(format!("{:.6}", cs.mean_dt));
+                                ui.monospace(match m.mean_dt {
+                                    Some(dt) => format!("{dt:.6}"),
+                                    None => "—".to_string(),
+                                });
                             });
                             row.col(|ui| {
-                                ui.monospace(format!("{:.6}", cs.jitter));
+                                ui.monospace(match jitter_of(m.can_id) {
+                                    Some(j) => format!("{j:.6}"),
+                                    None => "—".to_string(),
+                                });
                             });
                         });
                     }
@@ -402,6 +434,24 @@ fn analysis_tab(
             session.frame_count() as usize
         };
         ui.label(format!("matching frames: {total}"));
+
+        // Export the currently-filtered frames to CSV via the core exporter.
+        ui.horizontal(|ui| {
+            if ui.button("Export frames (CSV)…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .save_file()
+                {
+                    *export_status = Some(match session.export_frames_csv(&filter, &path) {
+                        Ok(n) => format!("Exported {n} frames to {}", basename(&path.display().to_string())),
+                        Err(e) => format!("Export failed: {e}"),
+                    });
+                }
+            }
+            if let Some(status) = export_status.as_deref() {
+                ui.label(status);
+            }
+        });
 
         // Render the health section (bounded content) BEFORE the frame table:
         // the frame table is virtualized and fills remaining height, so it must
@@ -625,6 +675,7 @@ fn graph_tab(
     selected: &mut BTreeSet<String>,
     t_start: f64,
     t_end: f64,
+    export_status: &mut Option<String>,
 ) {
     // --- Signal tree -------------------------------------------------------
     egui::SidePanel::left("signals")
@@ -676,6 +727,31 @@ fn graph_tab(
                     ));
                     ui.separator();
                 }
+            }
+        });
+
+        // Export the first selected signal's decoded series to CSV. The button
+        // is only reachable here (the panel returns early when nothing is
+        // selected), so at least one signal is always available.
+        ui.horizontal(|ui| {
+            if ui.button("Export signal (CSV)…").clicked() {
+                if let Some(name) = selected.iter().next() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .save_file()
+                    {
+                        *export_status = Some(match session.export_signal_csv(name, &path) {
+                            Ok(n) => format!(
+                                "Exported {n} samples of {name} to {}",
+                                basename(&path.display().to_string())
+                            ),
+                            Err(e) => format!("Export failed: {e}"),
+                        });
+                    }
+                }
+            }
+            if let Some(status) = export_status.as_deref() {
+                ui.label(status);
             }
         });
 

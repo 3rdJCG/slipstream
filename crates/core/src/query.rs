@@ -133,6 +133,24 @@ pub struct CycleStats {
     pub jitter: f64,
 }
 
+/// Per-message-id presence statistics: how many frames of a CAN id arrived,
+/// when first/last, and the average inter-arrival time. Unlike [`CycleStats`]
+/// (which omits ids with fewer than two frames), every distinct id is reported;
+/// `mean_dt` is `None` when fewer than two frames make a cadence undefined.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MessageStats {
+    pub can_id: u32,
+    /// Number of frames carrying this id in the combined store.
+    pub count: u64,
+    /// Earliest timestamp (seconds) for this id.
+    pub first_t: f64,
+    /// Latest timestamp (seconds) for this id.
+    pub last_t: f64,
+    /// Average inter-arrival time `(last_t - first_t) / (count - 1)`, or `None`
+    /// when `count < 2`.
+    pub mean_dt: Option<f64>,
+}
+
 // ---------------------------------------------------------------------------
 // Session — owns loaded state, answers queries
 // ---------------------------------------------------------------------------
@@ -182,7 +200,7 @@ pub struct Session {
     next_id: u32,
     /// Combined, time-ordered view of all loaded logs — rebuilt on add/remove so
     /// every query method can keep reading a single store, oblivious to multi-log.
-    store: FrameStore,
+    pub(crate) store: FrameStore,
     /// Total time span of the combined logs, seconds.
     duration: f64,
 }
@@ -487,7 +505,7 @@ impl Session {
     /// Row indices (into the full store) matching `filter`, including its
     /// optional signal predicate. O(n) scan; a future optimization is to cache
     /// this per filter (see CLAUDE.md).
-    fn matching_indices(&self, filter: &FrameFilter) -> Vec<usize> {
+    pub(crate) fn matching_indices(&self, filter: &FrameFilter) -> Vec<usize> {
         let cols = self.store.columns();
         let pred = filter.predicate.as_ref().map(|p| self.build_pred(p));
         (0..cols.len())
@@ -573,6 +591,45 @@ impl Session {
         ids.into_iter()
             .filter_map(|id| self.cycle_stats(id))
             .collect()
+    }
+
+    /// Message-level statistics for every distinct CAN id present, sorted
+    /// ascending by `can_id`. Single O(n) pass over the combined store: counts
+    /// frames per id and tracks first/last timestamp; `mean_dt` is the average
+    /// inter-arrival time, or `None` for ids with a single frame.
+    pub fn message_stats(&self) -> Vec<MessageStats> {
+        use std::collections::HashMap;
+        let cols = self.store.columns();
+        // (count, first_t, last_t) per id; frames are time-ordered, but we take
+        // explicit min/max so a single pass suffices regardless of order.
+        let mut acc: HashMap<u32, (u64, f64, f64)> = HashMap::new();
+        for i in 0..cols.len() {
+            let id = cols.can_id[i];
+            let t = cols.timestamp[i];
+            acc.entry(id)
+                .and_modify(|(count, first, last)| {
+                    *count += 1;
+                    *first = first.min(t);
+                    *last = last.max(t);
+                })
+                .or_insert((1, t, t));
+        }
+        let mut out: Vec<MessageStats> = acc
+            .into_iter()
+            .map(|(can_id, (count, first_t, last_t))| MessageStats {
+                can_id,
+                count,
+                first_t,
+                last_t,
+                mean_dt: if count >= 2 {
+                    Some((last_t - first_t) / (count - 1) as f64)
+                } else {
+                    None
+                },
+            })
+            .collect();
+        out.sort_by_key(|m| m.can_id);
+        out
     }
 
     /// Build default health rules from the DBC's `GenMsgCycleTime` attributes
@@ -706,7 +763,7 @@ impl Session {
     /// Decode a signal's `(timestamp, value)` series from the columnar frames
     /// via the DBC. Gathers all frames for the signal's `can_id` and decodes
     /// each payload (the column-at-a-time decode path).
-    fn signal_series(&self, name: &str) -> Result<Vec<(f64, f64)>> {
+    pub(crate) fn signal_series(&self, name: &str) -> Result<Vec<(f64, f64)>> {
         let (can_id, sig, channel) = self
             .find_signal(name)
             .ok_or_else(|| Error::UnknownSignal(name.to_string()))?;
@@ -917,6 +974,28 @@ mod tests {
             assert!((cs.mean_dt - expected).abs() < 1e-9, "mean_dt {}", cs.mean_dt);
             assert!(cs.jitter < 1e-6, "jitter {}", cs.jitter);
         }
+    }
+
+    #[test]
+    fn message_stats_demo() {
+        let s = Session::demo();
+        let stats = s.message_stats();
+        // Two distinct ids, sorted ascending.
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].can_id, 0x100);
+        assert_eq!(stats[1].can_id, 0x200);
+
+        let expected_dt = 60.0 / 5000.0; // ~0.012 s on the regular demo grid
+        for m in &stats {
+            assert_eq!(m.count, 5000, "count {}", m.count);
+            assert!(m.first_t >= 0.0 && m.last_t <= 60.0);
+            assert!(m.last_t > m.first_t);
+            let dt = m.mean_dt.expect("mean_dt with 5000 frames");
+            assert!((dt - expected_dt).abs() < 1e-3, "mean_dt {dt}");
+        }
+
+        // An absent id is simply not present.
+        assert!(stats.iter().all(|m| m.can_id != 0x999));
     }
 
     #[test]

@@ -65,9 +65,9 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [x] デコード済みシグナルの時系列プロット（デモ系列を実データに置き換え。demo は encode→decode を実走）
 - [x] 検索 / フィルタ（id / 時間範囲 / channel による。core: `FrameFilter` + `filtered_rows`/`filtered_count`。signal 値での絞り込みは下記「述語エンジン」で対応）
 - [x] 統計（件数、min/max、平均、周期/周波数）
-- [ ] メッセージ単位の統計（ID ごとの件数・実測周期。DBC 無し健全性の周期推定に流用）
+- [x] メッセージ単位の統計（ID ごとの件数・実測周期。DBC 無し健全性の周期推定に流用）
 - [ ] バス負荷率（bus load %。channel ごと、時間窓で算出）
-- [ ] エクスポート（フィルタ済み行 / デコード済みシグナル / 健全性レポートを出力。まず CSV、のち Parquet）
+- [x] エクスポート（フィルタ済み行 / デコード済みシグナル / 健全性レポートを出力。まず CSV、のち Parquet）— core: `Session::export_frames_csv`/`export_signal_csv`/`export_health_csv`（`export.rs`、`BufWriter<File>`、書き込み行数を返す）。Parquet は今後
 - [ ] ログ比較 / diff（2つのログを並べて表示。回帰/異常ビュー）
 - [x] CLI のみではなくファイルを開くダイアログ（`rfd`）
 - [ ] 複数シグナルのプロット軸 / カーソル / 範囲ズーム

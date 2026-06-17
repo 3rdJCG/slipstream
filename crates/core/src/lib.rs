@@ -19,6 +19,7 @@
 
 pub mod dbc;
 pub mod error;
+pub mod export;
 pub mod health;
 pub mod ingest;
 pub mod model;
