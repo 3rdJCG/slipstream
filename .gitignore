@@ -1,4 +1,7 @@
 /target
+
+# egui_kittest render artifacts (dev aid; not committed)
+crates/gui-egui/tests/snapshots/
 **/*.rs.bk
 *.pdb
 

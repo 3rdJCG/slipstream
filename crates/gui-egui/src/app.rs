@@ -270,7 +270,9 @@ impl App {
             filter_t_end: String::new(),
             health_tol_abs: false,
             health_tol_value: 0.3,
-            health_only_failing: true,
+            // Off by default so landing on Health shows all rules (an all-OK log
+            // with this on would render an empty table). Toggle on to focus.
+            health_only_failing: false,
             health_search: String::new(),
             health_view: HealthView::default(),
             manual_rules: Vec::new(),
@@ -1154,6 +1156,14 @@ fn health_rules_view(
             .then((b.missing + b.excessive).cmp(&(a.missing + a.excessive)))
             .then(a.can_id.cmp(&b.can_id))
     });
+    if rows.is_empty() {
+        ui.label(if only_failing && search.trim().is_empty() {
+            "✓ No failing rules."
+        } else {
+            "No rules match the filter."
+        });
+        return;
+    }
     ui.label(format!("{} rules", rows.len()));
     TableBuilder::new(ui)
         .id_salt("health_rule_table")
@@ -1800,4 +1810,39 @@ fn parse_hex_id(s: &str) -> Option<u32> {
     }
     let hex = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
     u32::from_str_radix(hex, 16).ok()
+}
+
+#[cfg(test)]
+mod snapshots {
+    //! Headless render of each tab to `tests/snapshots/*.new.png` via egui_kittest
+    //! (wgpu), so the UI can be inspected without a display. `#[ignore]`d so the
+    //! normal `cargo test` doesn't require a GPU; run explicitly:
+    //! `cargo test -p slipstream-gui-egui -- --ignored render_tabs`.
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+    use slipstream_core::Session;
+
+    fn shot(tab: &str, name: &str) {
+        let mut h = Harness::builder()
+            .with_size(egui::Vec2::new(1280.0, 800.0))
+            .wgpu()
+            .build_eframe(|cc| App::new(cc, Session::demo()));
+        h.run();
+        if tab != "Setup" {
+            h.get_by_label(tab).click();
+            h.run();
+        }
+        let _ = h.try_snapshot(name);
+    }
+
+    #[test]
+    #[ignore = "renders the GUI to tests/snapshots/*.new.png via wgpu; run explicitly"]
+    fn render_tabs() {
+        shot("Setup", "01_setup");
+        shot("Trace", "02_trace");
+        shot("Graphics", "03_graphics");
+        shot("Health", "04_health");
+        shot("Diff", "05_diff");
+    }
 }

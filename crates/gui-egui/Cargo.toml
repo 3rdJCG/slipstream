@@ -17,3 +17,8 @@ egui = "0.31"
 egui_plot = "0.31"
 egui_extras = "0.31"
 rfd = "0.17"
+
+[dev-dependencies]
+# Headless render of the GUI to PNG snapshots, so the UI can be visually
+# verified without a display (the model reads the PNGs; users get them too).
+egui_kittest = { version = "0.31", features = ["wgpu", "snapshot", "eframe"] }
