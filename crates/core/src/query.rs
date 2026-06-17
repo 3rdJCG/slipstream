@@ -892,11 +892,25 @@ impl Session {
         &self,
         rules: &crate::health::HealthRuleSet,
     ) -> Vec<crate::health::Violation> {
+        let by_id = self.frame_times_by_id();
         rules
             .rules
             .iter()
-            .flat_map(|rule| self.check_rule(rule))
+            .flat_map(|rule| self.check_rule(rule, &by_id))
             .collect()
+    }
+
+    /// Bucket every frame's timestamp by CAN id in a single O(n) pass. Health
+    /// checks reuse this so the cost is O(n) total, not O(rules × n) (a real DBC
+    /// has hundreds of cycle-time rules). Per-id timestamps stay time-ordered
+    /// because the store is.
+    fn frame_times_by_id(&self) -> std::collections::HashMap<u32, Vec<f64>> {
+        let cols = self.store.columns();
+        let mut by_id: std::collections::HashMap<u32, Vec<f64>> = std::collections::HashMap::new();
+        for i in 0..cols.len() {
+            by_id.entry(cols.can_id[i]).or_default().push(cols.timestamp[i]);
+        }
+        by_id
     }
 
     /// RPC-shaped health report: one [`RuleReport`] per rule (with per-kind
@@ -907,10 +921,11 @@ impl Session {
         rules: &crate::health::HealthRuleSet,
     ) -> crate::health::HealthReport {
         use crate::health::{HealthReport, RuleReport, ViolationKind};
+        let by_id = self.frame_times_by_id();
         let mut reports = Vec::with_capacity(rules.rules.len());
         let mut total_violations = 0u64;
         for rule in &rules.rules {
-            let violations = self.check_rule(rule);
+            let violations = self.check_rule(rule, &by_id);
             let mut missing = 0u64;
             let mut excessive = 0u64;
             let mut no_data = false;
@@ -943,16 +958,23 @@ impl Session {
     /// Check a single rule, returning its cadence violations (fewer than two
     /// gated frames yields a single `NoData` violation). Shared by
     /// [`Session::check_health`] and [`Session::health_report`].
-    fn check_rule(&self, rule: &crate::health::HealthRule) -> Vec<crate::health::Violation> {
+    fn check_rule(
+        &self,
+        rule: &crate::health::HealthRule,
+        by_id: &std::collections::HashMap<u32, Vec<f64>>,
+    ) -> Vec<crate::health::Violation> {
         use crate::health::{scan_cadence, Violation, ViolationKind};
-        let cols = self.store.columns();
-        let gate = self.build_pred(&rule.gate);
-        let mut times = Vec::new();
-        for i in 0..cols.len() {
-            if cols.can_id[i] == rule.can_id && gate.is_active(cols.timestamp[i]) {
-                times.push(cols.timestamp[i]);
-            }
-        }
+        // Only this id's timestamps (already time-ordered); apply the gate only
+        // when it actually constrains (Always = skip the per-frame eval).
+        let all_times = by_id.get(&rule.can_id).map(Vec::as_slice).unwrap_or(&[]);
+        let gated: Vec<f64>;
+        let times: &[f64] = if matches!(rule.gate, Predicate::Always) {
+            all_times
+        } else {
+            let gate = self.build_pred(&rule.gate);
+            gated = all_times.iter().copied().filter(|&t| gate.is_active(t)).collect();
+            &gated
+        };
         if times.len() < 2 {
             return vec![Violation {
                 can_id: rule.can_id,
@@ -963,7 +985,7 @@ impl Session {
                 expected_dt: rule.expected_dt,
             }];
         }
-        scan_cadence(rule.can_id, &times, rule.expected_dt, rule.tolerance)
+        scan_cadence(rule.can_id, times, rule.expected_dt, rule.tolerance)
     }
 
     /// Precompute a predicate evaluator, decoding any referenced signals once.
