@@ -162,6 +162,30 @@ pub struct BusLoadPoint {
     pub load_pct: f64,
 }
 
+/// Which side(s) of a two-log comparison a CAN id appears on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffStatus {
+    /// Present only in log A.
+    OnlyA,
+    /// Present only in log B.
+    OnlyB,
+    /// Present in both logs.
+    Both,
+}
+
+/// One CAN id's comparison between two logs: which side(s) carry it, plus the
+/// per-side frame count and average inter-arrival time (`0` / `None` on a side
+/// that lacks the id).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MessageDiff {
+    pub can_id: u32,
+    pub status: DiffStatus,
+    pub count_a: u64,
+    pub count_b: u64,
+    pub mean_dt_a: Option<f64>,
+    pub mean_dt_b: Option<f64>,
+}
+
 // ---------------------------------------------------------------------------
 // Session — owns loaded state, answers queries
 // ---------------------------------------------------------------------------
@@ -609,38 +633,63 @@ impl Session {
     /// frames per id and tracks first/last timestamp; `mean_dt` is the average
     /// inter-arrival time, or `None` for ids with a single frame.
     pub fn message_stats(&self) -> Vec<MessageStats> {
-        use std::collections::HashMap;
-        let cols = self.store.columns();
-        // (count, first_t, last_t) per id; frames are time-ordered, but we take
-        // explicit min/max so a single pass suffices regardless of order.
-        let mut acc: HashMap<u32, (u64, f64, f64)> = HashMap::new();
-        for i in 0..cols.len() {
-            let id = cols.can_id[i];
-            let t = cols.timestamp[i];
-            acc.entry(id)
-                .and_modify(|(count, first, last)| {
-                    *count += 1;
-                    *first = first.min(t);
-                    *last = last.max(t);
-                })
-                .or_insert((1, t, t));
+        message_stats_of(self.store.columns())
+    }
+
+    /// Compare two loaded logs by CAN id. Looks up logs `id_a` and `id_b`,
+    /// computes per-id message statistics on each log's own frames, and merges
+    /// them into a single Vec sorted ascending by `can_id`. Each entry carries
+    /// the [`DiffStatus`] (whether the id appears in only A, only B, or both)
+    /// plus the per-side counts and mean inter-arrival times (`0` / `None` on a
+    /// side that lacks the id). Errors with [`Error::Parse`] if either id names
+    /// no loaded log.
+    pub fn diff_logs(&self, id_a: u32, id_b: u32) -> Result<Vec<MessageDiff>> {
+        use std::collections::BTreeMap;
+        let log_a = self
+            .logs
+            .iter()
+            .find(|l| l.id == id_a)
+            .ok_or_else(|| Error::Parse(format!("no loaded log with id {id_a}")))?;
+        let log_b = self
+            .logs
+            .iter()
+            .find(|l| l.id == id_b)
+            .ok_or_else(|| Error::Parse(format!("no loaded log with id {id_b}")))?;
+
+        let stats_a = message_stats_of(&log_a.frames);
+        let stats_b = message_stats_of(&log_b.frames);
+
+        // (count, mean_dt) per side, keyed by can_id; BTreeMap keeps the merge
+        // sorted ascending without a separate sort pass.
+        let mut by_id: BTreeMap<u32, (Option<&MessageStats>, Option<&MessageStats>)> =
+            BTreeMap::new();
+        for m in &stats_a {
+            by_id.entry(m.can_id).or_default().0 = Some(m);
         }
-        let mut out: Vec<MessageStats> = acc
+        for m in &stats_b {
+            by_id.entry(m.can_id).or_default().1 = Some(m);
+        }
+
+        Ok(by_id
             .into_iter()
-            .map(|(can_id, (count, first_t, last_t))| MessageStats {
-                can_id,
-                count,
-                first_t,
-                last_t,
-                mean_dt: if count >= 2 {
-                    Some((last_t - first_t) / (count - 1) as f64)
-                } else {
-                    None
-                },
+            .map(|(can_id, (a, b))| {
+                let status = match (a.is_some(), b.is_some()) {
+                    (true, true) => DiffStatus::Both,
+                    (true, false) => DiffStatus::OnlyA,
+                    (false, true) => DiffStatus::OnlyB,
+                    // BTreeMap keys come from inserts, so at least one side is set.
+                    (false, false) => unreachable!(),
+                };
+                MessageDiff {
+                    can_id,
+                    status,
+                    count_a: a.map_or(0, |m| m.count),
+                    count_b: b.map_or(0, |m| m.count),
+                    mean_dt_a: a.and_then(|m| m.mean_dt),
+                    mean_dt_b: b.and_then(|m| m.mean_dt),
+                }
             })
-            .collect();
-        out.sort_by_key(|m| m.can_id);
-        out
+            .collect())
     }
 
     /// Per-channel, windowed bus-load estimate.
@@ -908,6 +957,44 @@ fn frame_on_wire_bits(is_extended: bool, is_fd: bool, dlc: u8) -> u64 {
         47
     };
     overhead + 8 * dlc as u64 + 3
+}
+
+/// Message-level statistics for every distinct CAN id in `cols`, sorted
+/// ascending by `can_id`. Single O(n) pass: counts frames per id and tracks
+/// first/last timestamp; `mean_dt` is the average inter-arrival time
+/// `(last_t - first_t) / (count - 1)`, or `None` for ids with a single frame.
+fn message_stats_of(cols: &FrameColumns) -> Vec<MessageStats> {
+    use std::collections::HashMap;
+    // (count, first_t, last_t) per id; frames are time-ordered, but we take
+    // explicit min/max so a single pass suffices regardless of order.
+    let mut acc: HashMap<u32, (u64, f64, f64)> = HashMap::new();
+    for i in 0..cols.len() {
+        let id = cols.can_id[i];
+        let t = cols.timestamp[i];
+        acc.entry(id)
+            .and_modify(|(count, first, last)| {
+                *count += 1;
+                *first = first.min(t);
+                *last = last.max(t);
+            })
+            .or_insert((1, t, t));
+    }
+    let mut out: Vec<MessageStats> = acc
+        .into_iter()
+        .map(|(can_id, (count, first_t, last_t))| MessageStats {
+            can_id,
+            count,
+            first_t,
+            last_t,
+            mean_dt: if count >= 2 {
+                Some((last_t - first_t) / (count - 1) as f64)
+            } else {
+                None
+            },
+        })
+        .collect();
+    out.sort_by_key(|m| m.can_id);
+    out
 }
 
 /// Distinct channels present in a frame set (sorted ascending).
@@ -1374,5 +1461,58 @@ mod tests {
         assert_eq!(s.list_dbcs().len(), base);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn diff_logs_by_can_id() {
+        // Log A: 0x100 (x2), 0x200 (x1). Log B: 0x200 (x2), 0x300 (x1).
+        // ASC classic line: `<ts> <ch> <idhex> Rx d <dlc> <bytes...>`.
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("slipstream_diff_a_{}.asc", std::process::id()));
+        let b = dir.join(format!("slipstream_diff_b_{}.asc", std::process::id()));
+        std::fs::write(
+            &a,
+            "0.0 1 100 Rx d 1 11\n0.1 1 100 Rx d 1 22\n0.2 1 200 Rx d 1 33\n",
+        )
+        .unwrap();
+        std::fs::write(&b, "0.0 1 200 Rx d 1 44\n0.1 1 200 Rx d 1 55\n0.2 1 300 Rx d 1 66\n").unwrap();
+
+        let mut s = Session::open(&a).unwrap();
+        let id_a = s.list_logs()[0].id;
+        let id_b = s.add_log(&b).unwrap();
+
+        let diff = s.diff_logs(id_a, id_b).expect("diff_logs");
+        // Three distinct ids across both logs, sorted ascending.
+        assert_eq!(diff.len(), 3);
+        assert!(diff.windows(2).all(|w| w[0].can_id < w[1].can_id));
+
+        // 0x100: only in A, two frames.
+        assert_eq!(diff[0].can_id, 0x100);
+        assert_eq!(diff[0].status, DiffStatus::OnlyA);
+        assert_eq!(diff[0].count_a, 2);
+        assert_eq!(diff[0].count_b, 0);
+        assert!(diff[0].mean_dt_a.is_some()); // two frames ⇒ a cadence
+        assert!(diff[0].mean_dt_b.is_none());
+
+        // 0x200: in both, one frame in A vs two in B.
+        assert_eq!(diff[1].can_id, 0x200);
+        assert_eq!(diff[1].status, DiffStatus::Both);
+        assert_eq!(diff[1].count_a, 1);
+        assert_eq!(diff[1].count_b, 2);
+        assert!(diff[1].mean_dt_a.is_none()); // single frame ⇒ no cadence
+        assert!(diff[1].mean_dt_b.is_some());
+
+        // 0x300: only in B, one frame.
+        assert_eq!(diff[2].can_id, 0x300);
+        assert_eq!(diff[2].status, DiffStatus::OnlyB);
+        assert_eq!(diff[2].count_a, 0);
+        assert_eq!(diff[2].count_b, 1);
+
+        // An unknown log id errors.
+        assert!(s.diff_logs(id_a, 9999).is_err());
+        assert!(s.diff_logs(9999, id_b).is_err());
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 }

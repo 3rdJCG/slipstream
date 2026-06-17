@@ -68,7 +68,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [x] メッセージ単位の統計（ID ごとの件数・実測周期。DBC 無し健全性の周期推定に流用）
 - [x] バス負荷率（bus load %。channel ごと、時間窓で算出）— gui(Analysis): 「Bus load」折りたたみセクション（bitrate/window の DragValue + channel/t_start/t_end/load% テーブル、500 行で打ち切り）
 - [x] エクスポート（フィルタ済み行 / デコード済みシグナル / 健全性レポートを出力。まず CSV、のち Parquet）— core: `Session::export_frames_csv`/`export_signal_csv`/`export_health_csv`（`export.rs`、`BufWriter<File>`、書き込み行数を返す）。Parquet は今後
-- [ ] ログ比較 / diff（2つのログを並べて表示。回帰/異常ビュー）
+- [x] ログ比較 / diff（2つのログを並べて表示。回帰/異常ビュー）
 - [x] CLI のみではなくファイルを開くダイアログ（`rfd`）
 - [ ] 複数シグナルのプロット軸 / カーソル / 範囲ズーム
 
@@ -128,6 +128,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [x] **Config** タブ — BLF/ASC ファイルの読み込み、DBC の設定、インジェスト進捗の表示
 - [x] **Analysis** タブ — フレーム単位の解析（行テーブル / 検索・フィルタ / 統計 / 健全性のルール設定＋結果）
 - [x] **Graph** タブ — デコード済みシグナルのプロット（軸 / カーソル / 範囲ズーム）
+- [x] **Diff** タブ — 2つのログを CAN id 単位で比較（`Session::diff_logs`、存在差分・件数・Δ件数・平均周期のテーブル表示。OnlyA/OnlyB を色分け）
 - [ ] タブ間で選択状態（時間範囲・対象 ID/シグナル）を共有・連動させる
 - [ ] 各タブの空状態（log 未ロード / DBC 未設定）の表示
 

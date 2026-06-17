@@ -4,7 +4,7 @@ use egui_extras::{Column, TableBuilder};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
 use slipstream_core::model::SignalMeta;
-use slipstream_core::query::{DecimateRequest, FrameFilter, StatsRequest};
+use slipstream_core::query::{DecimateRequest, DiffStatus, FrameFilter, StatsRequest};
 use slipstream_core::Session;
 
 /// Top-level tabs. Each is a thin view over the *same* [`Session`].
@@ -13,6 +13,7 @@ enum Tab {
     Config,
     Analysis,
     Graph,
+    Diff,
 }
 
 /// Thin egui view over a [`Session`]. Holds only UI state; all data comes from
@@ -46,6 +47,11 @@ pub struct App {
     /// Last CSV-export result (success row count or error), shown in the
     /// Analysis/Graph tabs; `None` = nothing exported yet this session.
     export_status: Option<String>,
+    // --- Diff tab state ----------------------------------------------------
+    /// Selected log id for side A of the diff (`None` = not yet chosen).
+    diff_a: Option<u32>,
+    /// Selected log id for side B of the diff (`None` = not yet chosen).
+    diff_b: Option<u32>,
 }
 
 impl App {
@@ -68,6 +74,8 @@ impl App {
             bus_window: 1.0,
             config_error: None,
             export_status: None,
+            diff_a: None,
+            diff_b: None,
         }
     }
 }
@@ -91,6 +99,8 @@ impl eframe::App for App {
             bus_window,
             config_error,
             export_status,
+            diff_a,
+            diff_b,
         } = self;
 
         // --- Tab bar -------------------------------------------------------
@@ -99,6 +109,7 @@ impl eframe::App for App {
                 ui.selectable_value(tab, Tab::Config, "Config");
                 ui.selectable_value(tab, Tab::Analysis, "Analysis");
                 ui.selectable_value(tab, Tab::Graph, "Graph");
+                ui.selectable_value(tab, Tab::Diff, "Diff");
             });
         });
 
@@ -125,6 +136,7 @@ impl eframe::App for App {
                 *t_end,
                 export_status,
             ),
+            Tab::Diff => diff_tab(ctx, session, diff_a, diff_b),
         }
     }
 }
@@ -877,6 +889,141 @@ fn graph_tab(
                             series.bins.iter().map(|b| [b.t, b.v_max]).collect();
                         pui.line(Line::new(pts).name(name));
                     }
+                }
+            });
+    });
+}
+
+/// Diff tab — compare two loaded logs by CAN id. Thin view: it picks two log
+/// ids from [`Session::list_logs`] and renders [`Session::diff_logs`] as a table
+/// (per-id presence, counts, count delta, and mean inter-arrival times).
+fn diff_tab(
+    ctx: &egui::Context,
+    session: &Session,
+    diff_a: &mut Option<u32>,
+    diff_b: &mut Option<u32>,
+) {
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.heading("Diff");
+        ui.separator();
+
+        let logs = session.list_logs();
+        if logs.len() < 2 {
+            ui.label("Load at least two logs in Config to diff.");
+            return;
+        }
+
+        // Label a log by its path basename, falling back to its id.
+        let label_for = |id: u32| -> String {
+            logs.iter()
+                .find(|l| l.id == id)
+                .map(|l| basename(&l.path).to_string())
+                .unwrap_or_else(|| format!("log {id}"))
+        };
+        let selected_text = |sel: &Option<u32>| -> String {
+            match sel {
+                Some(id) => label_for(*id),
+                None => "—".to_string(),
+            }
+        };
+
+        ui.horizontal(|ui| {
+            ui.label("Log A:");
+            egui::ComboBox::from_id_salt("diff_log_a")
+                .selected_text(selected_text(diff_a))
+                .show_ui(ui, |ui| {
+                    for l in &logs {
+                        ui.selectable_value(diff_a, Some(l.id), basename(&l.path));
+                    }
+                });
+            ui.separator();
+            ui.label("Log B:");
+            egui::ComboBox::from_id_salt("diff_log_b")
+                .selected_text(selected_text(diff_b))
+                .show_ui(ui, |ui| {
+                    for l in &logs {
+                        ui.selectable_value(diff_b, Some(l.id), basename(&l.path));
+                    }
+                });
+        });
+        ui.separator();
+
+        let (a, b) = match (*diff_a, *diff_b) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                ui.label("Pick a log for both A and B.");
+                return;
+            }
+        };
+        if a == b {
+            ui.label("Pick two different logs to compare.");
+            return;
+        }
+
+        let diffs = match session.diff_logs(a, b) {
+            Ok(d) => d,
+            Err(e) => {
+                ui.colored_label(egui::Color32::RED, format!("Diff failed: {e}"));
+                return;
+            }
+        };
+
+        ui.label(format!("{} CAN ids", diffs.len()));
+        TableBuilder::new(ui)
+            .id_salt("log_diff_table")
+            .striped(true)
+            .resizable(true)
+            .column(Column::auto())
+            .column(Column::auto())
+            .column(Column::auto())
+            .column(Column::auto())
+            .column(Column::auto())
+            .column(Column::auto())
+            .column(Column::remainder())
+            .header(20.0, |mut header| {
+                for h in ["id", "status", "count A", "count B", "Δcount", "mean_dt A", "mean_dt B"]
+                {
+                    header.col(|ui| {
+                        ui.strong(h);
+                    });
+                }
+            })
+            .body(|mut body| {
+                for d in &diffs {
+                    body.row(18.0, |mut row| {
+                        // Tint rows present on only one side so regressions stand out.
+                        let color = match d.status {
+                            DiffStatus::OnlyA => Some(egui::Color32::from_rgb(220, 120, 120)),
+                            DiffStatus::OnlyB => Some(egui::Color32::from_rgb(120, 180, 120)),
+                            DiffStatus::Both => None,
+                        };
+                        let mono = |ui: &mut egui::Ui, text: String| match color {
+                            Some(c) => {
+                                ui.monospace(egui::RichText::new(text).color(c));
+                            }
+                            None => {
+                                ui.monospace(text);
+                            }
+                        };
+                        let status = match d.status {
+                            DiffStatus::OnlyA => "OnlyA",
+                            DiffStatus::OnlyB => "OnlyB",
+                            DiffStatus::Both => "Both",
+                        };
+                        // Count delta (B − A), signed so a drop in B reads negative.
+                        let dcount = d.count_b as i64 - d.count_a as i64;
+                        let fmt_dt = |dt: Option<f64>| match dt {
+                            Some(v) => format!("{v:.6}"),
+                            None => "—".to_string(),
+                        };
+                        row.col(|ui| mono(ui, format!("0x{:X}", d.can_id)));
+                        row.col(|ui| mono(ui, status.to_string()));
+                        row.col(|ui| mono(ui, d.count_a.to_string()));
+                        row.col(|ui| mono(ui, d.count_b.to_string()));
+                        row.col(|ui| mono(ui, dcount.to_string()));
+                        row.col(|ui| mono(ui, fmt_dt(d.mean_dt_a)));
+                        row.col(|ui| mono(ui, fmt_dt(d.mean_dt_b)));
+                    });
                 }
             });
     });
