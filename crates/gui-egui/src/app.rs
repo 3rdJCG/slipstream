@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use egui_extras::{Column, TableBuilder};
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Legend, Line, Plot, PlotPoints, VLine};
 
 use slipstream_core::model::SignalMeta;
 use slipstream_core::query::{DecimateRequest, DiffStatus, FrameFilter, StatsRequest};
@@ -25,8 +25,17 @@ pub struct App {
     tab: Tab,
     // --- Graph tab state ---------------------------------------------------
     selected: BTreeSet<String>,
-    t_start: f64,
+    /// Decoded-signal duration `[0, t_end]`; refreshed on load for the Config
+    /// summary and as the default decimation window.
     t_end: f64,
+    /// Visible x-range of the plot, captured last frame and used to re-decimate
+    /// at the current zoom level (`None` = use the full `[0, duration]` window).
+    plot_x_range: Option<(f64, f64)>,
+    /// Last plot-cursor position `(t, v)` in data coordinates, for the readout.
+    cursor: Option<(f64, f64)>,
+    /// When set, each signal is scaled to 0..1 by its own decimated min/max
+    /// (a stand-in for true multi-Y-axis plotting, which egui_plot lacks).
+    plot_normalize: bool,
     // --- Analysis tab filter inputs ----------------------------------------
     /// Hex CAN id text (e.g. `100`, `0x200`); empty = no id constraint.
     filter_id: String,
@@ -63,8 +72,10 @@ impl App {
             signals,
             tab: Tab::Config,
             selected: BTreeSet::new(),
-            t_start: 0.0,
             t_end,
+            plot_x_range: None,
+            cursor: None,
+            plot_normalize: false,
             filter_id: String::new(),
             filter_t_start: String::new(),
             filter_t_end: String::new(),
@@ -88,8 +99,10 @@ impl eframe::App for App {
             signals,
             tab,
             selected,
-            t_start,
             t_end,
+            plot_x_range,
+            cursor,
+            plot_normalize,
             filter_id,
             filter_t_start,
             filter_t_end,
@@ -132,8 +145,9 @@ impl eframe::App for App {
                 session,
                 signals,
                 selected,
-                *t_start,
-                *t_end,
+                plot_x_range,
+                cursor,
+                plot_normalize,
                 export_status,
             ),
             Tab::Diff => diff_tab(ctx, session, diff_a, diff_b),
@@ -789,10 +803,14 @@ fn graph_tab(
     session: &Session,
     signals: &[SignalMeta],
     selected: &mut BTreeSet<String>,
-    t_start: f64,
-    t_end: f64,
+    plot_x_range: &mut Option<(f64, f64)>,
+    cursor: &mut Option<(f64, f64)>,
+    plot_normalize: &mut bool,
     export_status: &mut Option<String>,
 ) {
+    // Effective decimation window: the range we captured from the plot last
+    // frame (so zooming in fetches finer detail), falling back to the whole log.
+    let (t_start, t_end) = plot_x_range.unwrap_or((0.0, session.duration()));
     // --- Signal tree -------------------------------------------------------
     egui::SidePanel::left("signals")
         .resizable(true)
@@ -871,9 +889,25 @@ fn graph_tab(
             }
         });
 
+        // Normalize toggle: a stand-in for multi-Y-axis (egui_plot is single-Y).
+        ui.horizontal(|ui| {
+            ui.checkbox(plot_normalize, "Normalize (0..1 per signal)");
+            if *plot_normalize {
+                ui.label("— normalized view: each signal scaled by its own min/max");
+            }
+        });
+
+        // Cursor readout from last frame's pointer position.
+        if let Some((cx, cy)) = *cursor {
+            ui.label(format!("cursor: t={cx:.3} v={cy:.3}"));
+        } else {
+            ui.label("cursor: —");
+        }
+
         // Decimate to the plot's pixel width — only screen-sized data crosses
         // the core boundary, regardless of how big the log is.
         let px = ui.available_width().max(1.0) as u32;
+        let normalize = *plot_normalize;
         Plot::new("signal_plot")
             .legend(Legend::default())
             .show(ui, |pui| {
@@ -885,11 +919,47 @@ fn graph_tab(
                         px_width: px,
                     };
                     if let Ok(series) = session.decimate(&req) {
-                        let pts: PlotPoints =
-                            series.bins.iter().map(|b| [b.t, b.v_max]).collect();
+                        let pts: PlotPoints = if normalize {
+                            // Scale to 0..1 by this signal's own decimated extent.
+                            let lo = series
+                                .bins
+                                .iter()
+                                .map(|b| b.v_min)
+                                .fold(f64::INFINITY, f64::min);
+                            let hi = series
+                                .bins
+                                .iter()
+                                .map(|b| b.v_max)
+                                .fold(f64::NEG_INFINITY, f64::max);
+                            let span = hi - lo;
+                            // Guard divide-by-zero (flat signal / empty extent).
+                            let scale = |v: f64| {
+                                if span.is_finite() && span > 0.0 {
+                                    (v - lo) / span
+                                } else {
+                                    0.0
+                                }
+                            };
+                            series.bins.iter().map(|b| [b.t, scale(b.v_max)]).collect()
+                        } else {
+                            series.bins.iter().map(|b| [b.t, b.v_max]).collect()
+                        };
                         pui.line(Line::new(pts).name(name));
                     }
                 }
+
+                // Draw a cursor VLine at the pointer and capture (t, v) for the
+                // readout shown above on the next frame.
+                if let Some(p) = pui.pointer_coordinate() {
+                    *cursor = Some((p.x, p.y));
+                    pui.vline(VLine::new(p.x));
+                }
+
+                // Capture the visible x-range so next frame re-decimates at the
+                // current zoom (one-frame lag is fine). Drag-pan / scroll-zoom /
+                // box-zoom / double-click-reset stay enabled (egui_plot defaults).
+                let b = pui.plot_bounds();
+                *plot_x_range = Some((b.min()[0], b.max()[0]));
             });
     });
 }
