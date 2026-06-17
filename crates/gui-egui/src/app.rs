@@ -169,6 +169,16 @@ enum Tab {
     Diff,
 }
 
+/// Which Health-tab detail view is shown (one at a time, below the always-visible
+/// summary, to keep the tab uncluttered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HealthView {
+    #[default]
+    Rules,
+    Violations,
+    Timeline,
+}
+
 /// Thin egui view over a [`Session`]. Holds only UI state; all data comes from
 /// core query calls.
 pub struct App {
@@ -201,6 +211,13 @@ pub struct App {
     /// Tolerance value: a fraction (e.g. `0.3` = ±30%) when `health_tol_abs` is
     /// false, or milliseconds when it is true.
     health_tol_value: f64,
+    /// Health tab: show only failing rules/violations (default on — the primary
+    /// task is finding problems).
+    health_only_failing: bool,
+    /// Health tab: hex CAN-id substring filter for the rules/violations lists.
+    health_search: String,
+    /// Health tab: which detail view (Rules/Violations/Timeline) is shown.
+    health_view: HealthView,
     /// Manual health rules `(can_id, expected_ms)` added in the Health tab for
     /// frames the DBC doesn't declare a cycle time for. They reuse the tolerance
     /// above and an `Always` gate.
@@ -253,6 +270,9 @@ impl App {
             filter_t_end: String::new(),
             health_tol_abs: false,
             health_tol_value: 0.3,
+            health_only_failing: true,
+            health_search: String::new(),
+            health_view: HealthView::default(),
             manual_rules: Vec::new(),
             new_rule_id: String::new(),
             new_rule_ms: String::new(),
@@ -286,6 +306,9 @@ impl eframe::App for App {
             filter_t_end,
             health_tol_abs,
             health_tol_value,
+            health_only_failing,
+            health_search,
+            health_view,
             manual_rules,
             new_rule_id,
             new_rule_ms,
@@ -352,6 +375,9 @@ impl eframe::App for App {
                 channel_filter,
                 health_tol_abs,
                 health_tol_value,
+                health_only_failing,
+                health_search,
+                health_view,
                 manual_rules,
                 new_rule_id,
                 new_rule_ms,
@@ -898,6 +924,9 @@ fn health_tab(
     channel_filter: &BTreeSet<u8>,
     health_tol_abs: &mut bool,
     health_tol_value: &mut f64,
+    health_only_failing: &mut bool,
+    health_search: &mut String,
+    health_view: &mut HealthView,
     manual_rules: &mut Vec<(u32, f64)>,
     new_rule_id: &mut String,
     new_rule_ms: &mut String,
@@ -1016,22 +1045,222 @@ fn health_tab(
             }
         });
 
-    // --- CENTER: Timeline spot (Phase 2) + summary + violations ------------
+    // --- CENTER: always-visible summary + one detail view at a time --------
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.heading("Health");
+        let report = acache.health.as_ref();
+
+        // Prominent pass/fail summary — the first thing the eye lands on.
+        health_summary(ui, report);
+
+        // Controls: filter to problems + search by id + CSV export.
+        ui.horizontal(|ui| {
+            ui.checkbox(health_only_failing, "Show only failing");
+            ui.separator();
+            ui.label("id:");
+            ui.add(
+                egui::TextEdit::singleline(health_search)
+                    .desired_width(72.0)
+                    .hint_text("hex"),
+            );
+            ui.separator();
+            // Rebuild the ruleset for export (cheap: O(DBC messages)); matches
+            // what the memoized report was built from.
+            let rules =
+                build_health_rules(session, *health_tol_abs, *health_tol_value, manual_rules);
+            if ui.button("Export CSV…").clicked() {
+                if let Some(path) =
+                    rfd::FileDialog::new().add_filter("CSV", &["csv"]).save_file()
+                {
+                    *export_status = Some(match session.export_health_csv(&rules, &path) {
+                        Ok(n) => format!("Exported {n} rows"),
+                        Err(e) => format!("Export failed: {e}"),
+                    });
+                }
+            }
+            if let Some(s) = export_status.as_deref() {
+                ui.label(s);
+            }
+        });
+
+        // Segmented view selector — show one detail view at a time.
+        ui.horizontal(|ui| {
+            ui.selectable_value(health_view, HealthView::Rules, "Rules");
+            ui.selectable_value(health_view, HealthView::Violations, "Violations");
+            ui.selectable_value(health_view, HealthView::Timeline, "Timeline");
+        });
         ui.separator();
 
-        // Per-id health timeline (one lane per rule), driven entirely by the
-        // memoized report + message stats — no new per-frame scan.
-        health_timeline(ui, acache.health.as_ref(), &acache.msgs);
-        ui.separator();
-
-        // Rebuild the ruleset for the CSV export (cheap: O(DBC messages), not
-        // O(frames)); it matches exactly what the memoized report was built from.
-        let rules =
-            build_health_rules(session, *health_tol_abs, *health_tol_value, manual_rules);
-        health_results(ui, acache.health.as_ref(), &rules, export_status, session);
+        match report {
+            None => {
+                ui.label("Load a DBC in Setup, or add a manual rule on the left.");
+            }
+            Some(r) => match *health_view {
+                HealthView::Rules => {
+                    health_rules_view(ui, r, *health_only_failing, health_search)
+                }
+                HealthView::Violations => {
+                    health_violations_view(ui, r, *health_only_failing, health_search)
+                }
+                HealthView::Timeline => health_timeline(ui, Some(r), &acache.msgs),
+            },
+        }
     });
+}
+
+/// A prominent, color-coded pass/fail line for the Health tab.
+fn health_summary(ui: &mut egui::Ui, report: Option<&HealthReport>) {
+    let text = match report {
+        None => egui::RichText::new("No rules defined").italics(),
+        Some(r) if r.all_ok => egui::RichText::new(format!("✓ All OK — {} rules", r.rules.len()))
+            .color(egui::Color32::from_rgb(60, 180, 90))
+            .strong(),
+        Some(r) => {
+            let failing = r.rules.iter().filter(|rr| !rr.ok).count();
+            egui::RichText::new(format!(
+                "✗ {failing}/{} rules failing · {} violations",
+                r.rules.len(),
+                r.total_violations
+            ))
+            .color(egui::Color32::from_rgb(220, 80, 80))
+            .strong()
+        }
+    };
+    ui.add(egui::Label::new(text.size(16.0)));
+}
+
+/// Does `0x{id:X}` contain the (case-insensitive) search substring?
+fn id_matches(id: u32, search: &str) -> bool {
+    let s = search.trim();
+    s.is_empty() || format!("{id:X}").contains(&s.trim_start_matches("0x").to_uppercase())
+}
+
+/// Rules view: one row per rule, failing first then by violation count, filtered
+/// by the "only failing" toggle and the id search.
+fn health_rules_view(
+    ui: &mut egui::Ui,
+    report: &HealthReport,
+    only_failing: bool,
+    search: &str,
+) {
+    let mut rows: Vec<&slipstream_core::health::RuleReport> = report
+        .rules
+        .iter()
+        .filter(|rr| (!only_failing || !rr.ok) && id_matches(rr.can_id, search))
+        .collect();
+    // Priority: failing first, then most violations first.
+    rows.sort_by(|a, b| {
+        a.ok.cmp(&b.ok)
+            .then((b.missing + b.excessive).cmp(&(a.missing + a.excessive)))
+            .then(a.can_id.cmp(&b.can_id))
+    });
+    ui.label(format!("{} rules", rows.len()));
+    TableBuilder::new(ui)
+        .id_salt("health_rule_table")
+        .striped(true)
+        .resizable(true)
+        .column(Column::initial(64.0).at_least(48.0)) // id
+        .column(Column::initial(150.0).at_least(60.0).clip(true)) // name
+        .column(Column::initial(40.0)) // ok
+        .column(Column::initial(64.0)) // missing
+        .column(Column::initial(72.0)) // excessive
+        .column(Column::remainder()) // expected_dt
+        .header(20.0, |mut header| {
+            for h in ["id", "name", "ok", "missing", "excessive", "expected"] {
+                header.col(|ui| {
+                    ui.strong(h);
+                });
+            }
+        })
+        .body(|body| {
+            body.rows(18.0, rows.len(), |mut row| {
+                let rr = rows[row.index()];
+                row.col(|ui| {
+                    ui.monospace(format!("0x{:X}", rr.can_id));
+                });
+                row.col(|ui| {
+                    ui.monospace(&rr.name);
+                });
+                row.col(|ui| {
+                    if rr.ok {
+                        ui.colored_label(egui::Color32::from_rgb(60, 180, 90), "✓");
+                    } else {
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "✗");
+                    }
+                });
+                row.col(|ui| {
+                    ui.monospace(rr.missing.to_string());
+                });
+                row.col(|ui| {
+                    ui.monospace(rr.excessive.to_string());
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.4} s", rr.expected_dt));
+                });
+            });
+        });
+}
+
+/// Violations view: flattened, filtered, capped list of individual violations.
+fn health_violations_view(
+    ui: &mut egui::Ui,
+    report: &HealthReport,
+    only_failing: bool,
+    search: &str,
+) {
+    let all: Vec<&slipstream_core::health::Violation> = report
+        .rules
+        .iter()
+        .filter(|rr| !only_failing || !rr.ok)
+        .flat_map(|rr| rr.violations.iter())
+        .filter(|v| id_matches(v.can_id, search))
+        .collect();
+    let shown = all.len().min(HEALTH_VIOLATION_LIMIT);
+    if all.len() > shown {
+        ui.label(format!("first {shown} of {} violations", all.len()));
+    } else {
+        ui.label(format!("{} violations", all.len()));
+    }
+    TableBuilder::new(ui)
+        .id_salt("health_violation_table")
+        .striped(true)
+        .resizable(true)
+        .column(Column::initial(64.0).at_least(48.0)) // id
+        .column(Column::initial(80.0)) // kind
+        .column(Column::initial(88.0)) // t_start
+        .column(Column::initial(88.0)) // t_end
+        .column(Column::initial(96.0)) // observed
+        .column(Column::remainder()) // expected
+        .header(20.0, |mut header| {
+            for h in ["id", "kind", "t_start", "t_end", "observed", "expected"] {
+                header.col(|ui| {
+                    ui.strong(h);
+                });
+            }
+        })
+        .body(|body| {
+            body.rows(18.0, shown, |mut row| {
+                let v = all[row.index()];
+                row.col(|ui| {
+                    ui.monospace(format!("0x{:X}", v.can_id));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:?}", v.kind));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.4}", v.t_start));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.4}", v.t_end));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.4}", v.observed_dt));
+                });
+                row.col(|ui| {
+                    ui.monospace(format!("{:.4}", v.expected_dt));
+                });
+            });
+        });
 }
 
 /// Per-id health timeline (CENTER of the Health tab, above the tables). Thin
@@ -1127,167 +1356,6 @@ fn health_timeline(ui: &mut egui::Ui, report: Option<&HealthReport>, msgs: &[Mes
 /// the per-frame rebuild cheap even when a log has very many violations.
 const HEALTH_VIOLATION_LIMIT: usize = 500;
 
-/// Health-results section (CENTER of the Health tab). Thin view: it displays the
-/// memoized [`HealthReport`] passed in — the per-rule summary table, a (capped)
-/// list of individual violations, and the CSV export. It does NOT run the health
-/// query itself (that happens in [`AnalysisCache::refresh`]); the
-/// tolerance/manual-rule controls live in the tab's left side panel.
-fn health_results(
-    ui: &mut egui::Ui,
-    report: Option<&HealthReport>,
-    rules: &HealthRuleSet,
-    export_status: &mut Option<String>,
-    session: &Session,
-) {
-    // Use the memoized report (built from the DBC + manual rules in
-    // `AnalysisCache::refresh`). `None` means no rules are defined yet.
-    let report = match report {
-        Some(r) => r,
-        None => {
-            ui.label("Load a DBC in Setup or add a manual rule to derive cycle rules.");
-            return;
-        }
-    };
-
-    ui.horizontal(|ui| {
-        ui.label(format!("rules: {}", report.rules.len()));
-        ui.separator();
-        ui.label(format!("total violations: {}", report.total_violations));
-        ui.separator();
-        ui.label(if report.all_ok { "all ok ✓" } else { "violations ✗" });
-    });
-
-    // Export the health report to CSV via the core exporter.
-    ui.horizontal(|ui| {
-        if ui.button("Export health (CSV)…").clicked() {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("CSV", &["csv"])
-                .save_file()
-            {
-                *export_status = Some(match session.export_health_csv(rules, &path) {
-                    Ok(n) => format!(
-                        "Exported {n} health rows to {}",
-                        basename(&path.display().to_string())
-                    ),
-                    Err(e) => format!("Export failed: {e}"),
-                });
-            }
-        }
-        if let Some(status) = export_status.as_deref() {
-            ui.label(status);
-        }
-    });
-
-    // --- Per-rule summary table ------------------------------------
-    ui.add_space(4.0);
-    ui.strong("Rules");
-    TableBuilder::new(ui)
-        .id_salt("health_rule_table")
-        .striped(true)
-        .resizable(true)
-        .auto_shrink([false, true])
-        .max_scroll_height(220.0)
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::remainder())
-        .header(20.0, |mut header| {
-            for h in ["id", "name", "expected_dt", "ok", "missing", "excessive", "no_data"]
-            {
-                header.col(|ui| {
-                    ui.strong(h);
-                });
-            }
-        })
-        .body(|mut body| {
-            for rr in &report.rules {
-                body.row(18.0, |mut row| {
-                    row.col(|ui| {
-                        ui.monospace(format!("0x{:X}", rr.can_id));
-                    });
-                    row.col(|ui| {
-                        ui.monospace(&rr.name);
-                    });
-                    row.col(|ui| {
-                        ui.monospace(format!("{:.6}", rr.expected_dt));
-                    });
-                    row.col(|ui| {
-                        ui.monospace(if rr.ok { "✓" } else { "✗" });
-                    });
-                    row.col(|ui| {
-                        ui.monospace(rr.missing.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.monospace(rr.excessive.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.monospace(if rr.no_data { "✗" } else { "—" });
-                    });
-                });
-            }
-        });
-
-    // --- Violations table (capped) ---------------------------------
-    ui.add_space(8.0);
-    ui.strong("Violations");
-    // Flatten the per-rule violations into one ordered list, then cap it.
-    let all: Vec<&slipstream_core::health::Violation> =
-        report.rules.iter().flat_map(|rr| rr.violations.iter()).collect();
-    let shown = all.len().min(HEALTH_VIOLATION_LIMIT);
-    if all.len() > HEALTH_VIOLATION_LIMIT {
-        ui.label(format!(
-            "showing first {shown} of {} violations (truncated)",
-            all.len()
-        ));
-    } else {
-        ui.label(format!("{} violations", all.len()));
-    }
-    // Last widget in the panel: let this virtualized table fill the remaining
-    // height (no `auto_shrink`/`max_scroll_height` cap) so it doesn't overlap.
-    TableBuilder::new(ui)
-        .id_salt("health_violation_table")
-        .striped(true)
-        .resizable(true)
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::auto())
-        .column(Column::remainder())
-        .header(20.0, |mut header| {
-            for h in ["id", "kind", "t_start", "t_end", "observed_dt", "expected_dt"] {
-                header.col(|ui| {
-                    ui.strong(h);
-                });
-            }
-        })
-        .body(|body| {
-            body.rows(18.0, shown, |mut row| {
-                let v = all[row.index()];
-                row.col(|ui| {
-                    ui.monospace(format!("0x{:X}", v.can_id));
-                });
-                row.col(|ui| {
-                    ui.monospace(format!("{:?}", v.kind));
-                });
-                row.col(|ui| {
-                    ui.monospace(format!("{:.4}", v.t_start));
-                });
-                row.col(|ui| {
-                    ui.monospace(format!("{:.4}", v.t_end));
-                });
-                row.col(|ui| {
-                    ui.monospace(format!("{:.6}", v.observed_dt));
-                });
-                row.col(|ui| {
-                    ui.monospace(format!("{:.6}", v.expected_dt));
-                });
-            });
-        });
-}
 
 /// Maximum number of bus-load rows the table will display, to keep the
 /// per-frame rebuild cheap even when a log spans very many windows/channels.
