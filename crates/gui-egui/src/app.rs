@@ -207,6 +207,10 @@ pub struct App {
     /// When set, each signal is scaled to 0..1 by its own decimated min/max
     /// (a stand-in for true multi-Y-axis plotting, which egui_plot lacks).
     plot_normalize: bool,
+    /// Which axes zoom (scroll/pinch) responds to, in the Graphics plots.
+    plot_zoom: egui::Vec2b,
+    /// Which axes drag-pan responds to, in the Graphics plots.
+    plot_pan: egui::Vec2b,
     // --- Trace/Health tab filter inputs ------------------------------------
     /// Hex CAN id text (e.g. `100`, `0x200`); empty = no id constraint.
     filter_id: String,
@@ -276,6 +280,8 @@ impl App {
             t_end,
             cursor: None,
             plot_normalize: false,
+            plot_zoom: egui::Vec2b::new(true, true),
+            plot_pan: egui::Vec2b::new(true, true),
             filter_id: String::new(),
             filter_t_start: String::new(),
             filter_t_end: String::new(),
@@ -314,6 +320,8 @@ impl eframe::App for App {
             t_end,
             cursor,
             plot_normalize,
+            plot_zoom,
+            plot_pan,
             filter_id,
             filter_t_start,
             filter_t_end,
@@ -375,6 +383,8 @@ impl eframe::App for App {
                 next_graph_id,
                 cursor,
                 plot_normalize,
+                plot_zoom,
+                plot_pan,
                 export_status,
             ),
             Tab::Health => health_tab(
@@ -1490,6 +1500,8 @@ fn graphics_tab(
     next_graph_id: &mut u32,
     cursor: &mut Option<(f64, f64)>,
     plot_normalize: &mut bool,
+    plot_zoom: &mut egui::Vec2b,
+    plot_pan: &mut egui::Vec2b,
     export_status: &mut Option<String>,
 ) {
     // --- LEFT: per-graph signal pickers (CANalyzer-style add/remove) -------
@@ -1499,6 +1511,17 @@ fn graphics_tab(
         .show(ctx, |ui| {
             ui.heading("Graphs");
             ui.checkbox(plot_normalize, "Normalize (0..1 per signal)");
+            // Per-axis zoom/pan: choose which axes scroll-zoom and drag-pan act on
+            // (x = time, shared across graphs; y = per-graph value).
+            ui.horizontal(|ui| {
+                ui.label("Zoom:");
+                ui.checkbox(&mut plot_zoom.x, "X");
+                ui.checkbox(&mut plot_zoom.y, "Y");
+                ui.separator();
+                ui.label("Pan:");
+                ui.checkbox(&mut plot_pan.x, "X");
+                ui.checkbox(&mut plot_pan.y, "Y");
+            });
             if ui.button("➕ Add graph").clicked() {
                 graphs.push(GraphPanel {
                     id: *next_graph_id,
@@ -1621,8 +1644,13 @@ fn graphics_tab(
             Plot::new(("graph", g.id))
                 .height(plot_h)
                 .legend(Legend::default())
+                // Share the time (x) axis + cursor across graphs; y stays per-graph.
                 .link_axis("graphics_time", egui::Vec2b::new(true, false))
                 .link_cursor("graphics_time", egui::Vec2b::new(true, false))
+                // Per-axis zoom/pan per the toggles above.
+                .allow_zoom(*plot_zoom)
+                .allow_scroll(*plot_zoom)
+                .allow_drag(*plot_pan)
                 .show(ui, |pui| {
                     for name in &g.signals {
                         let Some(series) =
@@ -1864,17 +1892,23 @@ mod snapshots {
         {
             let app = h.state_mut();
             app.tab = Tab::Graphics;
+            // One signal per graph → each graph keeps its own Y scale while
+            // sharing the time (x) axis (the requested layout).
             app.graphs = vec![
                 GraphPanel {
                     id: 0,
-                    signals: vec!["EngineSpeed".into(), "CoolantTemp".into()],
+                    signals: vec!["EngineSpeed".into()],
                 },
                 GraphPanel {
                     id: 1,
+                    signals: vec!["CoolantTemp".into()],
+                },
+                GraphPanel {
+                    id: 2,
                     signals: vec!["VehicleSpeed".into()],
                 },
             ];
-            app.next_graph_id = 2;
+            app.next_graph_id = 3;
         }
         h.run();
         let _ = h.try_snapshot("03b_graphics_populated");
