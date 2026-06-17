@@ -3,9 +3,173 @@ use std::collections::BTreeSet;
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Legend, Line, Plot, PlotPoints, VLine};
 
+use slipstream_core::health::{HealthReport, HealthRule, Tolerance};
 use slipstream_core::model::SignalMeta;
-use slipstream_core::query::{DecimateRequest, DiffStatus, FrameFilter, StatsRequest};
+use slipstream_core::predicate::Predicate;
+use slipstream_core::query::{
+    BusLoadPoint, CycleStats, DecimateRequest, DecimatedSeries, DiffStatus, FrameFilter,
+    MessageStats, StatsRequest,
+};
 use slipstream_core::Session;
+
+/// Memoized results of the (O(n)) Analysis/Graph queries. Each field is paired
+/// with the key it was computed from; [`AnalysisCache::refresh`] recomputes a
+/// field only when its key changed, so a 50 MB log isn't re-scanned on every
+/// repaint. `data_epoch` bumps on any session mutation (see `config_tab`),
+/// invalidating everything that depends on the loaded data.
+#[derive(Default)]
+struct AnalysisCache {
+    // --- Per-id aggregates (message/cycle stats + unknown ids) -------------
+    msgs: Vec<MessageStats>,
+    cycles: Vec<CycleStats>,
+    unknown: Vec<u32>,
+    agg_epoch: u64,
+    // --- Filtered store-row indices ----------------------------------------
+    filtered: Vec<u64>,
+    filter_active: bool,
+    /// Key: (epoch, can_ids, t_start, t_end, channels).
+    filter_key: (u64, Vec<u32>, Option<f64>, Option<f64>, Vec<u8>),
+    // --- Health report ------------------------------------------------------
+    health: Option<HealthReport>,
+    /// Key: (epoch, tol_abs, tol_value bits, manual rules).
+    health_key: (u64, bool, u64, Vec<(u32, f64)>),
+    // --- Bus load -----------------------------------------------------------
+    bus: Vec<BusLoadPoint>,
+    /// Key: (epoch, bitrate, window in bits — `f64::to_bits`).
+    bus_key: (u64, u32, u64),
+    // --- Graph decimation ---------------------------------------------------
+    graph: Vec<(String, DecimatedSeries)>,
+    /// Key: (epoch, selected signal names, t_start bits, t_end bits, px_width,
+    /// normalize). The x-range is rounded to ~1e-3 before hashing into the key
+    /// so sub-millisecond pan jitter doesn't force a re-decode every frame.
+    graph_key: (u64, Vec<String>, u64, u64, u32, bool),
+}
+
+impl AnalysisCache {
+    /// Refresh the Analysis-tab caches whose keys changed. Called once near the
+    /// top of `analysis_tab`; the per-section render code then reads the cached
+    /// fields without re-querying the session.
+    #[allow(clippy::too_many_arguments)]
+    fn refresh(
+        &mut self,
+        session: &Session,
+        data_epoch: u64,
+        filter: &FrameFilter,
+        filter_active: bool,
+        tol_abs: bool,
+        tol_value: f64,
+        manual_rules: &[(u32, f64)],
+        bitrate: u32,
+        window: f64,
+    ) {
+        // Aggregates: recompute on any data change.
+        if self.agg_epoch != data_epoch {
+            self.msgs = session.message_stats();
+            self.cycles = session.all_cycle_stats();
+            self.unknown = session.unknown_frame_ids();
+            self.agg_epoch = data_epoch;
+        }
+
+        // Filtered indices: only while a filter is active, and only when the
+        // filter (or data) changed. Inactive → leave empty.
+        self.filter_active = filter_active;
+        if filter_active {
+            let key = (
+                data_epoch,
+                filter.can_ids.clone(),
+                filter.t_start,
+                filter.t_end,
+                filter.channels.clone(),
+            );
+            if self.filter_key != key {
+                self.filtered = session.filtered_indices(filter);
+                self.filter_key = key;
+            }
+        } else {
+            self.filtered.clear();
+        }
+
+        // Health report: recompute when tolerance, manual rules, or data change.
+        let health_key = (
+            data_epoch,
+            tol_abs,
+            tol_value.to_bits(),
+            manual_rules.to_vec(),
+        );
+        if self.health_key != health_key {
+            let tolerance = if tol_abs {
+                Tolerance::AbsSeconds(tol_value / 1000.0)
+            } else {
+                Tolerance::Percent(tol_value)
+            };
+            let mut rules = session.dbc_health_rules(tolerance);
+            for &(can_id, expected_ms) in manual_rules {
+                rules.rules.push(HealthRule {
+                    can_id,
+                    name: format!("manual 0x{can_id:X}"),
+                    expected_dt: expected_ms / 1000.0,
+                    tolerance,
+                    gate: Predicate::Always,
+                });
+            }
+            self.health = if rules.rules.is_empty() {
+                None
+            } else {
+                Some(session.health_report(&rules))
+            };
+            self.health_key = health_key;
+        }
+
+        // Bus load: recompute when bitrate, window, or data change.
+        let bus_key = (data_epoch, bitrate, window.to_bits());
+        if self.bus_key != bus_key {
+            self.bus = session.bus_load(bitrate, window);
+            self.bus_key = bus_key;
+        }
+    }
+
+    /// Refresh the Graph-tab decimation cache, re-decoding only when the
+    /// selection, zoom window, pixel width, normalize toggle, or data change.
+    #[allow(clippy::too_many_arguments)]
+    fn refresh_graph(
+        &mut self,
+        session: &Session,
+        data_epoch: u64,
+        selected: &[String],
+        t_start: f64,
+        t_end: f64,
+        px_width: u32,
+        normalize: bool,
+    ) {
+        // Round the x-range to ~1e-3 s so tiny pan/zoom jitter (and the
+        // one-frame-lag bounds capture) doesn't invalidate the cache constantly.
+        let round = |v: f64| (v * 1000.0).round() as i64 as f64;
+        let key = (
+            data_epoch,
+            selected.to_vec(),
+            round(t_start).to_bits(),
+            round(t_end).to_bits(),
+            px_width,
+            normalize,
+        );
+        if self.graph_key == key {
+            return;
+        }
+        self.graph_key = key;
+        self.graph.clear();
+        for name in selected {
+            let req = DecimateRequest {
+                signal: name.clone(),
+                t_start,
+                t_end,
+                px_width,
+            };
+            if let Ok(series) = session.decimate(&req) {
+                self.graph.push((name.clone(), series));
+            }
+        }
+    }
+}
 
 /// Top-level tabs. Each is a thin view over the *same* [`Session`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +237,13 @@ pub struct App {
     diff_a: Option<u32>,
     /// Selected log id for side B of the diff (`None` = not yet chosen).
     diff_b: Option<u32>,
+    // --- Memoization -------------------------------------------------------
+    /// Bumped on every successful session mutation (in `config_tab`). Used as
+    /// part of each cache key so the Analysis/Graph queries recompute when the
+    /// loaded data changes.
+    data_epoch: u64,
+    /// Memoized Analysis/Graph query results (see [`AnalysisCache`]).
+    acache: AnalysisCache,
 }
 
 impl App {
@@ -103,6 +274,8 @@ impl App {
             export_status: None,
             diff_a: None,
             diff_b: None,
+            data_epoch: 1,
+            acache: AnalysisCache::default(),
         }
     }
 }
@@ -134,6 +307,8 @@ impl eframe::App for App {
             export_status,
             diff_a,
             diff_b,
+            data_epoch,
+            acache,
         } = self;
 
         // --- Tab bar -------------------------------------------------------
@@ -147,10 +322,12 @@ impl eframe::App for App {
         });
 
         match tab {
-            Tab::Config => config_tab(ctx, session, signals, t_end, config_error),
+            Tab::Config => config_tab(ctx, session, signals, t_end, config_error, data_epoch),
             Tab::Analysis => analysis_tab(
                 ctx,
                 session,
+                *data_epoch,
+                acache,
                 filter_id,
                 filter_t_start,
                 filter_t_end,
@@ -167,6 +344,8 @@ impl eframe::App for App {
             Tab::Graph => graph_tab(
                 ctx,
                 session,
+                *data_epoch,
+                acache,
                 signals,
                 selected,
                 plot_x_range,
@@ -190,6 +369,7 @@ fn config_tab(
     signals: &mut Vec<SignalMeta>,
     t_end: &mut f64,
     config_error: &mut Option<String>,
+    data_epoch: &mut u64,
 ) {
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.heading("Config");
@@ -217,6 +397,7 @@ fn config_tab(
                             *signals = session.available_signals();
                             *t_end = session.duration();
                             *config_error = None;
+                            *data_epoch += 1;
                         }
                         Err(e) => *config_error = Some(format!("Open log failed: {e}")),
                     }
@@ -232,6 +413,7 @@ fn config_tab(
                         Ok(_id) => {
                             *signals = session.available_signals();
                             *config_error = None;
+                            *data_epoch += 1;
                         }
                         Err(e) => *config_error = Some(format!("Open DBC failed: {e}")),
                     }
@@ -265,6 +447,7 @@ fn config_tab(
                             *signals = session.available_signals();
                             *t_end = session.duration();
                             *config_error = None;
+                            *data_epoch += 1;
                         }
                         Err(e) => *config_error = Some(format!("Open project failed: {e}")),
                     }
@@ -318,6 +501,7 @@ fn config_tab(
             session.remove_log(id);
             *signals = session.available_signals();
             *t_end = session.duration();
+            *data_epoch += 1;
         }
 
         // --- Loaded DBCs -------------------------------------------------
@@ -373,10 +557,12 @@ fn config_tab(
         if let Some((id, ch)) = dbc_set_channel {
             session.set_dbc_channel(id, ch);
             *signals = session.available_signals();
+            *data_epoch += 1;
         }
         if let Some(id) = dbc_to_remove {
             session.remove_dbc(id);
             *signals = session.available_signals();
+            *data_epoch += 1;
         }
     });
 }
@@ -400,9 +586,12 @@ fn channels_label(channels: &[u8]) -> String {
 }
 
 /// Analysis tab — filterable virtualized frame table plus per-id cycle stats.
+#[allow(clippy::too_many_arguments)]
 fn analysis_tab(
     ctx: &egui::Context,
     session: &Session,
+    data_epoch: u64,
+    acache: &mut AnalysisCache,
     filter_id: &mut String,
     filter_t_start: &mut String,
     filter_t_end: &mut String,
@@ -446,6 +635,21 @@ fn analysis_tab(
         || filter.t_end.is_some()
         || !filter.channels.is_empty();
 
+    // Refresh all Analysis caches ONCE; each recomputes only when its inputs
+    // (or `data_epoch`) changed. Everything below renders from `acache` instead
+    // of re-scanning the (potentially millions of) frames on every repaint.
+    acache.refresh(
+        session,
+        data_epoch,
+        &filter,
+        active,
+        *health_tol_abs,
+        *health_tol_value,
+        manual_rules,
+        *bus_bitrate,
+        *bus_window,
+    );
+
     // --- Messages (bottom strip) -------------------------------------------
     // One per-id row, merging presence stats (count, mean_dt from
     // `message_stats`) with cadence jitter (from `all_cycle_stats`). Both are
@@ -456,8 +660,8 @@ fn analysis_tab(
         .default_height(200.0)
         .show(ctx, |ui| {
             ui.heading("Messages");
-            let msgs = session.message_stats();
-            let cycles = session.all_cycle_stats();
+            let msgs = &acache.msgs;
+            let cycles = &acache.cycles;
             let jitter_of = |id: u32| -> Option<f64> {
                 cycles
                     .iter()
@@ -487,7 +691,7 @@ fn analysis_tab(
                     });
                 })
                 .body(|mut body| {
-                    for m in &msgs {
+                    for m in msgs {
                         body.row(18.0, |mut row| {
                             row.col(|ui| {
                                 ui.monospace(format!("0x{:X}", m.can_id));
@@ -547,9 +751,10 @@ fn analysis_tab(
         ui.separator();
 
         // Drive the count/window off the filter; fall back to all rows when no
-        // constraint is set. The total is the row count for the table.
+        // constraint is set. The total is the row count for the table. When a
+        // filter is active this reads the memoized index list (no rescan).
         let total = if active {
-            session.filtered_count(&filter) as usize
+            acache.filtered.len()
         } else {
             session.frame_count() as usize
         };
@@ -578,7 +783,8 @@ fn analysis_tab(
         // be the last widget in the panel or it overlaps what follows.
         health_section(
             ui,
-            session,
+            acache.health.as_ref(),
+            &acache.unknown,
             health_tol_abs,
             health_tol_value,
             manual_rules,
@@ -589,7 +795,7 @@ fn analysis_tab(
 
         // Bus load is also bounded content; keep it BEFORE the frame table so the
         // virtualized table stays last and doesn't overlap it.
-        bus_load_section(ui, session, bus_bitrate, bus_window);
+        bus_load_section(ui, &acache.bus, bus_bitrate, bus_window);
         ui.separator();
 
         TableBuilder::new(ui)
@@ -620,13 +826,13 @@ fn analysis_tab(
             })
             .body(|body| {
                 body.rows(18.0, total, |mut row| {
-                    let i = row.index();
-                    // Fetch exactly the one visible row through the view-driven
-                    // window API, so only screen-sized data crosses the boundary.
+                    let k = row.index();
+                    // Map visible row → store row via the memoized filtered index
+                    // list, then fetch it O(1). No per-row rescan of the store.
                     let r = if active {
-                        session.filtered_rows(&filter, i as u64, 1).rows.into_iter().next()
+                        acache.filtered.get(k).and_then(|&i| session.frame_row(i))
                     } else {
-                        session.frame_row(i as u64)
+                        session.frame_row(k as u64)
                     };
                     if let Some(r) = r {
                         row.col(|ui| {
@@ -654,23 +860,22 @@ fn analysis_tab(
 /// the per-frame rebuild cheap even when a log has very many violations.
 const HEALTH_VIOLATION_LIMIT: usize = 500;
 
-/// Frame-health section of the Analysis tab (collapsing). Thin view: it derives
-/// rules from the DBC via [`Session::dbc_health_rules`] and runs
-/// [`Session::health_report`] each frame (cheap enough for the demo), then shows
-/// a per-rule summary plus a (capped) list of individual violations.
+/// Frame-health section of the Analysis tab (collapsing). Thin view: it renders
+/// the tolerance/manual-rule controls (which only mutate App state — the
+/// [`AnalysisCache`] picks the changes up next frame) and displays the memoized
+/// [`HealthReport`] passed in, plus a (capped) list of individual violations. It
+/// does NOT run the health query itself anymore.
 #[allow(clippy::too_many_arguments)]
 fn health_section(
     ui: &mut egui::Ui,
-    session: &Session,
+    report: Option<&HealthReport>,
+    unknown: &[u32],
     health_tol_abs: &mut bool,
     health_tol_value: &mut f64,
     manual_rules: &mut Vec<(u32, f64)>,
     new_rule_id: &mut String,
     new_rule_ms: &mut String,
 ) {
-    use slipstream_core::health::{HealthRule, Tolerance};
-    use slipstream_core::predicate::Predicate;
-
     egui::CollapsingHeader::new("Health (frame cadence)")
         .default_open(false)
         .show(ui, |ui| {
@@ -700,13 +905,6 @@ fn health_section(
                     );
                 }
             });
-
-            // Build the Tolerance from the mode + value (ms → seconds for Abs).
-            let tolerance = if *health_tol_abs {
-                Tolerance::AbsSeconds(*health_tol_value / 1000.0)
-            } else {
-                Tolerance::Percent(*health_tol_value)
-            };
 
             // --- Manual rules (DBC-independent) ---------------------------
             ui.add_space(4.0);
@@ -744,7 +942,6 @@ fn health_section(
 
             // --- Unknown frames (no DBC/rule) -----------------------------
             ui.add_space(4.0);
-            let unknown = session.unknown_frame_ids();
             ui.strong("Unknown frames (no DBC/rule)");
             if unknown.is_empty() {
                 ui.label("—");
@@ -758,24 +955,15 @@ fn health_section(
             }
             ui.add_space(4.0);
 
-            // Derive cadence rules from the DBC and combine with the manual
-            // rules into one set. Building + running each frame is fine for the
-            // demo; revisit if it gets heavy.
-            let mut rules = session.dbc_health_rules(tolerance);
-            for &(can_id, expected_ms) in manual_rules.iter() {
-                rules.rules.push(HealthRule {
-                    can_id,
-                    name: format!("manual 0x{can_id:X}"),
-                    expected_dt: expected_ms / 1000.0,
-                    tolerance,
-                    gate: Predicate::Always,
-                });
-            }
-            if rules.rules.is_empty() {
-                ui.label("Load a DBC in Config or add a manual rule to derive cycle rules.");
-                return;
-            }
-            let report = session.health_report(&rules);
+            // Use the memoized report (built from the DBC + manual rules in
+            // `AnalysisCache::refresh`). `None` means no rules are defined yet.
+            let report = match report {
+                Some(r) => r,
+                None => {
+                    ui.label("Load a DBC in Config or add a manual rule to derive cycle rules.");
+                    return;
+                }
+            };
 
             ui.horizontal(|ui| {
                 ui.label(format!("rules: {}", report.rules.len()));
@@ -901,12 +1089,13 @@ fn health_section(
 /// per-frame rebuild cheap even when a log spans very many windows/channels.
 const BUS_LOAD_ROW_LIMIT: usize = 500;
 
-/// Bus-load section of the Analysis tab (collapsing). Thin view: it reads the
-/// nominal bitrate and window from UI state and calls [`Session::bus_load`],
-/// showing one row per (channel, window) with its on-wire load percentage.
+/// Bus-load section of the Analysis tab (collapsing). Thin view: it renders the
+/// bitrate/window inputs (which only mutate App state — the [`AnalysisCache`]
+/// recomputes the bus load next frame) and displays the memoized `points`
+/// passed in, one row per (channel, window) with its on-wire load percentage.
 fn bus_load_section(
     ui: &mut egui::Ui,
-    session: &Session,
+    points: &[BusLoadPoint],
     bus_bitrate: &mut u32,
     bus_window: &mut f64,
 ) {
@@ -929,7 +1118,6 @@ fn bus_load_section(
                 );
             });
 
-            let points = session.bus_load(*bus_bitrate, *bus_window);
             if points.is_empty() {
                 ui.label("No frames to compute bus load (load a log in Config).");
                 return;
@@ -985,9 +1173,12 @@ fn bus_load_section(
 }
 
 /// Graph tab — signal tree, decimated plot, and a per-signal stats strip.
+#[allow(clippy::too_many_arguments)]
 fn graph_tab(
     ctx: &egui::Context,
     session: &Session,
+    data_epoch: u64,
+    acache: &mut AnalysisCache,
     signals: &[SignalMeta],
     selected: &mut BTreeSet<String>,
     plot_x_range: &mut Option<(f64, f64)>,
@@ -1100,47 +1291,52 @@ fn graph_tab(
         }
 
         // Decimate to the plot's pixel width — only screen-sized data crosses
-        // the core boundary, regardless of how big the log is.
+        // the core boundary, regardless of how big the log is. Memoized: the
+        // (re-)decode runs only when the selection/zoom/width/normalize/data
+        // change, not on every repaint.
         let px = ui.available_width().max(1.0) as u32;
         let normalize = *plot_normalize;
+        let selected_names: Vec<String> = selected.iter().cloned().collect();
+        acache.refresh_graph(
+            session,
+            data_epoch,
+            &selected_names,
+            t_start,
+            t_end,
+            px,
+            normalize,
+        );
+        let graph = &acache.graph;
         Plot::new("signal_plot")
             .legend(Legend::default())
             .show(ui, |pui| {
-                for name in selected.iter() {
-                    let req = DecimateRequest {
-                        signal: name.clone(),
-                        t_start,
-                        t_end,
-                        px_width: px,
-                    };
-                    if let Ok(series) = session.decimate(&req) {
-                        let pts: PlotPoints = if normalize {
-                            // Scale to 0..1 by this signal's own decimated extent.
-                            let lo = series
-                                .bins
-                                .iter()
-                                .map(|b| b.v_min)
-                                .fold(f64::INFINITY, f64::min);
-                            let hi = series
-                                .bins
-                                .iter()
-                                .map(|b| b.v_max)
-                                .fold(f64::NEG_INFINITY, f64::max);
-                            let span = hi - lo;
-                            // Guard divide-by-zero (flat signal / empty extent).
-                            let scale = |v: f64| {
-                                if span.is_finite() && span > 0.0 {
-                                    (v - lo) / span
-                                } else {
-                                    0.0
-                                }
-                            };
-                            series.bins.iter().map(|b| [b.t, scale(b.v_max)]).collect()
-                        } else {
-                            series.bins.iter().map(|b| [b.t, b.v_max]).collect()
+                for (name, series) in graph {
+                    let pts: PlotPoints = if normalize {
+                        // Scale to 0..1 by this signal's own decimated extent.
+                        let lo = series
+                            .bins
+                            .iter()
+                            .map(|b| b.v_min)
+                            .fold(f64::INFINITY, f64::min);
+                        let hi = series
+                            .bins
+                            .iter()
+                            .map(|b| b.v_max)
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let span = hi - lo;
+                        // Guard divide-by-zero (flat signal / empty extent).
+                        let scale = |v: f64| {
+                            if span.is_finite() && span > 0.0 {
+                                (v - lo) / span
+                            } else {
+                                0.0
+                            }
                         };
-                        pui.line(Line::new(pts).name(name));
-                    }
+                        series.bins.iter().map(|b| [b.t, scale(b.v_max)]).collect()
+                    } else {
+                        series.bins.iter().map(|b| [b.t, b.v_max]).collect()
+                    };
+                    pui.line(Line::new(pts).name(name));
                 }
 
                 // Draw a cursor VLine at the pointer and capture (t, v) for the

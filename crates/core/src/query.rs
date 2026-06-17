@@ -633,6 +633,17 @@ impl Session {
         self.matching_indices(filter).len() as u64
     }
 
+    /// Store row indices matching `filter`, as `u64`. Compute this ONCE per
+    /// filter change and reuse it (e.g. a virtualized table maps visible row `k`
+    /// to `frame_row(indices[k])`) — calling `filtered_rows` per visible row
+    /// re-scans the whole store each time.
+    pub fn filtered_indices(&self, filter: &FrameFilter) -> Vec<u64> {
+        self.matching_indices(filter)
+            .into_iter()
+            .map(|i| i as u64)
+            .collect()
+    }
+
     /// A window of frames matching `filter`, windowed into the filtered list.
     /// Each returned row keeps its index in the full store.
     pub fn filtered_rows(&self, filter: &FrameFilter, start: u64, count: u32) -> RowWindow {

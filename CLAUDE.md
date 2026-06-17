@@ -150,8 +150,23 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [ ] エラーフレーム / 方向（Rx/Tx）を列として保持する（現状は破棄している）
 - [x] マルチプレクスシグナルのデコード（マルチプレクサ選択子を尊重する）— `SignalDef.mux: MuxRole{Plain/Multiplexor/Multiplexed(sel)}`（`map_signal` で設定、`MultiplexorAndMultiplexedSignal` は `Multiplexor` に単純化）。`signal_series` は Multiplexed シグナルを、同一メッセージの Multiplexor 値 == sel のフレームでのみデコード（Multiplexor 不在のメッセージは無条件デコードにフォールバック）
 - [x] DBC の文字コード（現状 UTF-8 前提。実ファイルは CP1252 等もあり得る → `can_dbc::encodings` で対応可）
-- [ ] フィルタが毎回 O(n) 全スキャン（`matching_indices`）— マルチGB + 対話フィルタ向けにインデックス化 / フィルタ結果キャッシュ
+- [ ] フィルタが毎回 O(n) 全スキャン（`matching_indices`）— マルチGB + 対話フィルタ向けにインデックス化 / フィルタ結果キャッシュ（core 側。GUI 側のフィルタ結果は下記「パフォーマンス」のメモ化で repaint ごとの再スキャンは解消済み）
 - [x] 拡張 ID（29bit）と標準 ID の区別フラグ（現状 `can_id: u32` のみで判別不可）
+
+## パフォーマンス（Performance）
+- [x] **Analysis/Graph タブのクエリをメモ化**（GUI 側、`gui-egui/src/app.rs` の `AnalysisCache`）。
+      egui は毎フレーム repaint するため、~50MB BLF（数百万フレーム）では従来 Analysis タブが
+      毎フレーム O(n) 全スキャンを多数走らせてフリーズしていた。各キャッシュは入力（および
+      `App.data_epoch`）が変わったときのみ再計算する:
+      - 集計（`message_stats`/`all_cycle_stats`/`unknown_frame_ids`）: `data_epoch` キー。
+      - フィルタ一致インデックス: フィルタがアクティブな時のみ `filtered_indices` を1回計算し、
+        `(epoch, can_ids, t_start, t_end, channels)` キーでメモ化。
+      - 健全性レポート / バス負荷 / グラフの間引き系列も各キーでメモ化。
+      `data_epoch` は Config タブのセッション変更（add/remove log・dbc、set_dbc_channel、
+      load_project）ごとに +1 する。
+- [x] **フレームテーブルの行ごとの再フィルタを撤廃**。従来は表示行ごとに
+      `session.filtered_rows(&filter, i, 1)`（各行で O(n) 全スキャン）を呼んでいた。今は
+      メモ化済みの `filtered` インデックス列を介して `frame_row(idx[k])`（O(1)）を引く。
 
 ## メモ / 決定事項（Notes / decisions）
 - `blf_asc` はシングルスレッドのイテレータ（コンテナを逐次 inflate）。正しく動作し、
