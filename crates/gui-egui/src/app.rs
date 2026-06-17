@@ -8,7 +8,7 @@ use slipstream_core::model::SignalMeta;
 use slipstream_core::predicate::Predicate;
 use slipstream_core::query::{
     BusLoadPoint, CycleStats, DecimateRequest, DecimatedSeries, DiffStatus, FrameFilter,
-    MessageStats, StatsRequest,
+    MessageStats,
 };
 use slipstream_core::Session;
 
@@ -179,6 +179,13 @@ enum HealthView {
     Timeline,
 }
 
+/// One Graphics-tab plot panel: an ordered set of signals drawn together. All
+/// panels share a linked time axis (CANalyzer-style stacked, time-aligned graphs).
+struct GraphPanel {
+    id: u32,
+    signals: Vec<String>,
+}
+
 /// Thin egui view over a [`Session`]. Holds only UI state; all data comes from
 /// core query calls.
 pub struct App {
@@ -187,14 +194,15 @@ pub struct App {
     /// Which tab is currently shown.
     tab: Tab,
     // --- Graphics tab state ------------------------------------------------
-    selected: BTreeSet<String>,
+    /// CANalyzer-style: signals are added to one or more graph panels (not a
+    /// global checklist). All panels share a linked time (x) axis.
+    graphs: Vec<GraphPanel>,
+    /// Id allocator for graph panels.
+    next_graph_id: u32,
     /// Decoded-signal duration `[0, t_end]`; refreshed on load for the Setup
-    /// summary and as the default decimation window.
+    /// summary and as the (full) decimation window.
     t_end: f64,
-    /// Visible x-range of the plot, captured last frame and used to re-decimate
-    /// at the current zoom level (`None` = use the full `[0, duration]` window).
-    plot_x_range: Option<(f64, f64)>,
-    /// Last plot-cursor position `(t, v)` in data coordinates, for the readout.
+    /// Last plot-cursor `(t_ms, v)` while hovering a graph, for the readout.
     cursor: Option<(f64, f64)>,
     /// When set, each signal is scaled to 0..1 by its own decimated min/max
     /// (a stand-in for true multi-Y-axis plotting, which egui_plot lacks).
@@ -260,9 +268,12 @@ impl App {
             session,
             signals,
             tab: Tab::Setup,
-            selected: BTreeSet::new(),
+            graphs: vec![GraphPanel {
+                id: 0,
+                signals: Vec::new(),
+            }],
+            next_graph_id: 1,
             t_end,
-            plot_x_range: None,
             cursor: None,
             plot_normalize: false,
             filter_id: String::new(),
@@ -280,7 +291,7 @@ impl App {
             new_rule_ms: String::new(),
             channel_filter: BTreeSet::new(),
             bus_bitrate: 500_000,
-            bus_window: 1.0,
+            bus_window: 1000.0,
             config_error: None,
             export_status: None,
             diff_a: None,
@@ -298,9 +309,9 @@ impl eframe::App for App {
             session,
             signals,
             tab,
-            selected,
+            graphs,
+            next_graph_id,
             t_end,
-            plot_x_range,
             cursor,
             plot_normalize,
             filter_id,
@@ -360,8 +371,8 @@ impl eframe::App for App {
                 *data_epoch,
                 acache,
                 signals,
-                selected,
-                plot_x_range,
+                graphs,
+                next_graph_id,
                 cursor,
                 plot_normalize,
                 export_status,
@@ -722,7 +733,8 @@ fn trace_tab(
         *health_tol_value,
         manual_rules,
         *bus_bitrate,
-        *bus_window,
+        // `bus_window` is milliseconds in the UI; core's bus_load takes seconds.
+        *bus_window / 1000.0,
     );
 
     // --- LEFT: filter, Messages table, Bus load ----------------------------
@@ -815,7 +827,7 @@ fn trace_tab(
                 .column(Column::auto())
                 .column(Column::remainder())
                 .header(20.0, |mut header| {
-                    for h in ["id", "count", "mean_dt", "jitter"] {
+                    for h in ["id", "count", "mean [ms]", "jitter [ms]"] {
                         header.col(|ui| {
                             ui.strong(h);
                         });
@@ -832,13 +844,13 @@ fn trace_tab(
                             });
                             row.col(|ui| {
                                 ui.monospace(match m.mean_dt {
-                                    Some(dt) => format!("{dt:.6}"),
+                                    Some(dt) => format!("{:.2}", dt * 1000.0),
                                     None => "—".to_string(),
                                 });
                             });
                             row.col(|ui| {
                                 ui.monospace(match jitter_of(m.can_id) {
-                                    Some(j) => format!("{j:.6}"),
+                                    Some(j) => format!("{:.2}", j * 1000.0),
                                     None => "—".to_string(),
                                 });
                             });
@@ -871,7 +883,7 @@ fn trace_tab(
             .column(Column::auto())
             .column(Column::remainder())
             .header(20.0, |mut header| {
-                for h in ["#", "time", "ch", "id", "data"] {
+                for h in ["#", "time [ms]", "ch", "id", "data"] {
                     header.col(|ui| {
                         ui.strong(h);
                     });
@@ -892,7 +904,7 @@ fn trace_tab(
                             ui.monospace(r.index.to_string());
                         });
                         row.col(|ui| {
-                            ui.monospace(format!("{:.4}", r.timestamp));
+                            ui.monospace(format!("{:.3}", r.timestamp * 1000.0));
                         });
                         row.col(|ui| {
                             ui.monospace(r.channel.to_string());
@@ -1176,7 +1188,7 @@ fn health_rules_view(
         .column(Column::initial(72.0)) // excessive
         .column(Column::remainder()) // expected_dt
         .header(20.0, |mut header| {
-            for h in ["id", "name", "ok", "missing", "excessive", "expected"] {
+            for h in ["id", "name", "ok", "missing", "excessive", "expected [ms]"] {
                 header.col(|ui| {
                     ui.strong(h);
                 });
@@ -1205,7 +1217,7 @@ fn health_rules_view(
                     ui.monospace(rr.excessive.to_string());
                 });
                 row.col(|ui| {
-                    ui.monospace(format!("{:.4} s", rr.expected_dt));
+                    ui.monospace(format!("{:.1}", rr.expected_dt * 1000.0));
                 });
             });
         });
@@ -1242,7 +1254,7 @@ fn health_violations_view(
         .column(Column::initial(96.0)) // observed
         .column(Column::remainder()) // expected
         .header(20.0, |mut header| {
-            for h in ["id", "kind", "t_start", "t_end", "observed", "expected"] {
+            for h in ["id", "kind", "t_start [ms]", "t_end [ms]", "observed [ms]", "expected [ms]"] {
                 header.col(|ui| {
                     ui.strong(h);
                 });
@@ -1258,16 +1270,16 @@ fn health_violations_view(
                     ui.monospace(format!("{:?}", v.kind));
                 });
                 row.col(|ui| {
-                    ui.monospace(format!("{:.4}", v.t_start));
+                    ui.monospace(format!("{:.3}", v.t_start * 1000.0));
                 });
                 row.col(|ui| {
-                    ui.monospace(format!("{:.4}", v.t_end));
+                    ui.monospace(format!("{:.3}", v.t_end * 1000.0));
                 });
                 row.col(|ui| {
-                    ui.monospace(format!("{:.4}", v.observed_dt));
+                    ui.monospace(format!("{:.3}", v.observed_dt * 1000.0));
                 });
                 row.col(|ui| {
-                    ui.monospace(format!("{:.4}", v.expected_dt));
+                    ui.monospace(format!("{:.3}", v.expected_dt * 1000.0));
                 });
             });
         });
@@ -1343,7 +1355,12 @@ fn health_timeline(ui: &mut egui::Ui, report: Option<&HealthReport>, msgs: &[Mes
                 // Present span: look up this rule's id in the memoized stats.
                 if let Some(m) = msgs.iter().find(|m| m.can_id == rr.can_id) {
                     pui.polygon(
-                        Polygon::new(PlotPoints::from(rect(m.first_t, m.last_t, idx, 0.3)))
+                        Polygon::new(PlotPoints::from(rect(
+                            m.first_t * 1000.0,
+                            m.last_t * 1000.0,
+                            idx,
+                            0.3,
+                        )))
                             .fill_color(green)
                             .stroke(egui::Stroke::NONE)
                             .allow_hover(false),
@@ -1352,7 +1369,12 @@ fn health_timeline(ui: &mut egui::Ui, report: Option<&HealthReport>, msgs: &[Mes
                 // Violation spans on top, slightly taller so they read clearly.
                 for v in &rr.violations {
                     pui.polygon(
-                        Polygon::new(PlotPoints::from(rect(v.t_start, v.t_end, idx, 0.35)))
+                        Polygon::new(PlotPoints::from(rect(
+                            v.t_start * 1000.0,
+                            v.t_end * 1000.0,
+                            idx,
+                            0.35,
+                        )))
                             .fill_color(red)
                             .stroke(egui::Stroke::NONE)
                             .allow_hover(false),
@@ -1392,11 +1414,11 @@ fn bus_load_section(
                         .range(1..=u32::MAX),
                 );
                 ui.separator();
-                ui.label("Window (s):");
+                ui.label("Window (ms):");
                 ui.add(
                     egui::DragValue::new(bus_window)
-                        .speed(0.1)
-                        .range(0.001..=f64::MAX),
+                        .speed(10.0)
+                        .range(1.0..=f64::MAX),
                 );
             });
 
@@ -1428,7 +1450,7 @@ fn bus_load_section(
                 .column(Column::auto())
                 .column(Column::remainder())
                 .header(20.0, |mut header| {
-                    for h in ["channel", "t_start", "t_end", "load %"] {
+                    for h in ["channel", "t_start [ms]", "t_end [ms]", "load %"] {
                         header.col(|ui| {
                             ui.strong(h);
                         });
@@ -1441,10 +1463,10 @@ fn bus_load_section(
                             ui.monospace(p.channel.to_string());
                         });
                         row.col(|ui| {
-                            ui.monospace(format!("{:.4}", p.t_start));
+                            ui.monospace(format!("{:.1}", p.t_start * 1000.0));
                         });
                         row.col(|ui| {
-                            ui.monospace(format!("{:.4}", p.t_end));
+                            ui.monospace(format!("{:.1}", p.t_end * 1000.0));
                         });
                         row.col(|ui| {
                             ui.monospace(format!("{:.2}", p.load_pct));
@@ -1464,39 +1486,36 @@ fn graphics_tab(
     data_epoch: u64,
     acache: &mut AnalysisCache,
     signals: &[SignalMeta],
-    selected: &mut BTreeSet<String>,
-    plot_x_range: &mut Option<(f64, f64)>,
+    graphs: &mut Vec<GraphPanel>,
+    next_graph_id: &mut u32,
     cursor: &mut Option<(f64, f64)>,
     plot_normalize: &mut bool,
     export_status: &mut Option<String>,
 ) {
-    // Effective decimation window: the range we captured from the plot last
-    // frame (so zooming in fetches finer detail), falling back to the whole log.
-    let (t_start, t_end) = plot_x_range.unwrap_or((0.0, session.duration()));
-    // --- Signal tree (grouped by message) ----------------------------------
+    // --- LEFT: per-graph signal pickers (CANalyzer-style add/remove) -------
     egui::SidePanel::left("signals")
         .resizable(true)
-        .default_width(260.0)
+        .default_width(280.0)
         .show(ctx, |ui| {
-            ui.heading("Signals");
-
-            // Normalize toggle: a stand-in for multi-Y-axis (egui_plot is single-Y).
+            ui.heading("Graphs");
             ui.checkbox(plot_normalize, "Normalize (0..1 per signal)");
-
-            // Export the first selected signal's decoded series to CSV. Disabled
-            // until at least one signal is selected (the core call needs a name).
-            ui.add_enabled_ui(!selected.is_empty(), |ui| {
+            if ui.button("➕ Add graph").clicked() {
+                graphs.push(GraphPanel {
+                    id: *next_graph_id,
+                    signals: Vec::new(),
+                });
+                *next_graph_id += 1;
+            }
+            // Export the first signal present in any graph.
+            let first_signal = graphs.iter().flat_map(|g| g.signals.first().cloned()).next();
+            ui.add_enabled_ui(first_signal.is_some(), |ui| {
                 if ui.button("Export signal (CSV)…").clicked() {
-                    if let Some(name) = selected.iter().next() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("CSV", &["csv"])
-                            .save_file()
+                    if let Some(name) = &first_signal {
+                        if let Some(path) =
+                            rfd::FileDialog::new().add_filter("CSV", &["csv"]).save_file()
                         {
                             *export_status = Some(match session.export_signal_csv(name, &path) {
-                                Ok(n) => format!(
-                                    "Exported {n} samples of {name} to {}",
-                                    basename(&path.display().to_string())
-                                ),
+                                Ok(n) => format!("Exported {n} samples of {name}"),
                                 Err(e) => format!("Export failed: {e}"),
                             });
                         }
@@ -1508,151 +1527,142 @@ fn graphics_tab(
             }
             ui.separator();
 
-            // Group signal checkboxes under a collapsing header per message name.
-            // `available_signals` returns rows ordered by message then signal, so
-            // consecutive entries with the same message belong together; we open a
-            // new header whenever the message name changes.
+            if signals.is_empty() {
+                ui.label("No decodable signals. Load a DBC in Setup.");
+                return;
+            }
+
+            // Defer mutations so we don't borrow `graphs` mutably mid-iteration.
+            let mut graph_to_remove: Option<usize> = None;
+            let mut add_to: Option<(usize, String)> = None;
+            let mut sig_to_remove: Option<(usize, usize)> = None;
+            let multi = graphs.len() > 1;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut i = 0;
-                while i < signals.len() {
-                    let message = signals[i].message.clone();
-                    let end = signals[i..]
-                        .iter()
-                        .position(|s| s.message != message)
-                        .map_or(signals.len(), |off| i + off);
-                    egui::CollapsingHeader::new(if message.is_empty() {
-                        "(no message)"
-                    } else {
-                        &message
-                    })
-                    .default_open(true)
-                    .id_salt(("sig_group", i))
-                    .show(ui, |ui| {
-                        for s in &signals[i..end] {
-                            let mut on = selected.contains(&s.name);
-                            let label = if s.unit.is_empty() {
-                                s.name.clone()
-                            } else {
-                                format!("{} [{}]", s.name, s.unit)
-                            };
-                            if ui.checkbox(&mut on, label).changed() {
-                                if on {
-                                    selected.insert(s.name.clone());
-                                } else {
-                                    selected.remove(&s.name);
-                                }
-                            }
+                for (gi, g) in graphs.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("Graph {}", gi + 1));
+                        if multi && ui.button("✕").on_hover_text("Remove graph").clicked() {
+                            graph_to_remove = Some(gi);
                         }
                     });
-                    i = end;
+                    // Picker: signals not already in this graph.
+                    egui::ComboBox::from_id_salt(("addsig", g.id))
+                        .selected_text("➕ add signal")
+                        .show_ui(ui, |ui| {
+                            for s in signals {
+                                if !g.signals.contains(&s.name)
+                                    && ui.selectable_label(false, &s.name).clicked()
+                                {
+                                    add_to = Some((gi, s.name.clone()));
+                                }
+                            }
+                        });
+                    for (si, name) in g.signals.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.button("✕").clicked() {
+                                sig_to_remove = Some((gi, si));
+                            }
+                            ui.monospace(name);
+                        });
+                    }
+                    ui.separator();
                 }
             });
+            if let Some((gi, name)) = add_to {
+                graphs[gi].signals.push(name);
+            }
+            if let Some((gi, si)) = sig_to_remove {
+                graphs[gi].signals.remove(si);
+            }
+            if let Some(gi) = graph_to_remove {
+                graphs.remove(gi);
+            }
         });
 
-    // --- Plot --------------------------------------------------------------
+    // --- CENTER: stacked, time-linked plots (x in milliseconds) ------------
     egui::CentralPanel::default().show(ctx, |ui| {
-        // Empty state: no decodable signals means no DBC is loaded (or it decodes
-        // nothing), so point at Setup rather than the generic select-a-signal hint.
         if signals.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label("No decodable signals. Load a DBC in the Setup tab.");
             });
             return;
         }
-        if selected.is_empty() {
+        // Union of all graphs' signals → decimate once over the FULL range. We
+        // deliberately do NOT re-decimate to the zoomed bounds: that bounds→data
+        // feedback loop was what made the plot jitter ("荒ぶる").
+        let mut union: Vec<String> = Vec::new();
+        for g in graphs.iter() {
+            for s in &g.signals {
+                if !union.contains(s) {
+                    union.push(s.clone());
+                }
+            }
+        }
+        if union.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("Select one or more signals on the left to plot.");
+                ui.label("Add a signal to a graph on the left (➕ add signal).");
             });
             return;
         }
 
-        // Stats strip for the selected signals over the current window.
-        ui.horizontal_wrapped(|ui| {
-            for name in selected.iter() {
-                let req = StatsRequest {
-                    signal: name.clone(),
-                    t_start,
-                    t_end,
-                };
-                if let Ok(st) = session.signal_stats(&req) {
-                    ui.label(format!(
-                        "{}: min {:.1} / max {:.1} / mean {:.1} (n={})",
-                        st.signal, st.min, st.max, st.mean, st.count
-                    ));
-                    ui.separator();
-                }
-            }
-        });
+        match *cursor {
+            Some((cx, cy)) => ui.label(format!("cursor:  t = {cx:.1} ms    v = {cy:.4}")),
+            None => ui.label("cursor:  —   (hover a graph)"),
+        };
 
-        // Cursor readout from last frame's pointer position.
-        if let Some((cx, cy)) = *cursor {
-            ui.label(format!("cursor: t={cx:.3} v={cy:.3}"));
-        } else {
-            ui.label("cursor: —");
-        }
-
-        // Decimate to the plot's pixel width — only screen-sized data crosses
-        // the core boundary, regardless of how big the log is. Memoized: the
-        // (re-)decode runs only when the selection/zoom/width/normalize/data
-        // change, not on every repaint.
         let px = ui.available_width().max(1.0) as u32;
         let normalize = *plot_normalize;
-        let selected_names: Vec<String> = selected.iter().cloned().collect();
-        acache.refresh_graph(
-            session,
-            data_epoch,
-            &selected_names,
-            t_start,
-            t_end,
-            px,
-            normalize,
-        );
-        let graph = &acache.graph;
-        Plot::new("signal_plot")
-            .legend(Legend::default())
-            .show(ui, |pui| {
-                for (name, series) in graph {
-                    let pts: PlotPoints = if normalize {
-                        // Scale to 0..1 by this signal's own decimated extent.
-                        let lo = series
-                            .bins
-                            .iter()
-                            .map(|b| b.v_min)
-                            .fold(f64::INFINITY, f64::min);
-                        let hi = series
-                            .bins
-                            .iter()
-                            .map(|b| b.v_max)
-                            .fold(f64::NEG_INFINITY, f64::max);
-                        let span = hi - lo;
-                        // Guard divide-by-zero (flat signal / empty extent).
-                        let scale = |v: f64| {
-                            if span.is_finite() && span > 0.0 {
-                                (v - lo) / span
-                            } else {
-                                0.0
-                            }
+        acache.refresh_graph(session, data_epoch, &union, 0.0, session.duration(), px, normalize);
+
+        // Stack one plot per graph; link the time (x) axis + cursor across them.
+        let n = graphs.len().max(1);
+        let plot_h = (ui.available_height() / n as f32 - 6.0).max(96.0);
+        for g in graphs.iter() {
+            Plot::new(("graph", g.id))
+                .height(plot_h)
+                .legend(Legend::default())
+                .link_axis("graphics_time", egui::Vec2b::new(true, false))
+                .link_cursor("graphics_time", egui::Vec2b::new(true, false))
+                .show(ui, |pui| {
+                    for name in &g.signals {
+                        let Some(series) =
+                            acache.graph.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+                        else {
+                            continue;
                         };
-                        series.bins.iter().map(|b| [b.t, scale(b.v_max)]).collect()
-                    } else {
-                        series.bins.iter().map(|b| [b.t, b.v_max]).collect()
-                    };
-                    pui.line(Line::new(pts).name(name));
-                }
-
-                // Draw a cursor VLine at the pointer and capture (t, v) for the
-                // readout shown above on the next frame.
-                if let Some(p) = pui.pointer_coordinate() {
-                    *cursor = Some((p.x, p.y));
-                    pui.vline(VLine::new(p.x));
-                }
-
-                // Capture the visible x-range so next frame re-decimates at the
-                // current zoom (one-frame lag is fine). Drag-pan / scroll-zoom /
-                // box-zoom / double-click-reset stay enabled (egui_plot defaults).
-                let b = pui.plot_bounds();
-                *plot_x_range = Some((b.min()[0], b.max()[0]));
-            });
+                        // x in ms; normalize scales y to 0..1 by the signal's extent.
+                        let pts: PlotPoints = if normalize {
+                            let lo =
+                                series.bins.iter().map(|b| b.v_min).fold(f64::INFINITY, f64::min);
+                            let hi = series
+                                .bins
+                                .iter()
+                                .map(|b| b.v_max)
+                                .fold(f64::NEG_INFINITY, f64::max);
+                            let span = hi - lo;
+                            let scale = move |v: f64| {
+                                if span.is_finite() && span > 0.0 {
+                                    (v - lo) / span
+                                } else {
+                                    0.0
+                                }
+                            };
+                            series.bins.iter().map(|b| [b.t * 1000.0, scale(b.v_max)]).collect()
+                        } else {
+                            series.bins.iter().map(|b| [b.t * 1000.0, b.v_max]).collect()
+                        };
+                        pui.line(Line::new(pts).name(name));
+                    }
+                    // Cursor only while actually hovering this plot (fixes the
+                    // readout/VLine showing when the pointer is elsewhere).
+                    if pui.response().hovered() {
+                        if let Some(p) = pui.pointer_coordinate() {
+                            *cursor = Some((p.x, p.y));
+                            pui.vline(VLine::new(p.x));
+                        }
+                    }
+                });
+        }
     });
 }
 
@@ -1844,5 +1854,29 @@ mod snapshots {
         shot("Graphics", "03_graphics");
         shot("Health", "04_health");
         shot("Diff", "05_diff");
+
+        // Graphics with two time-linked graphs populated with signals, so the
+        // actual plots (ms x-axis, stacked, shared time) can be inspected.
+        let mut h = Harness::builder()
+            .with_size(egui::Vec2::new(1280.0, 800.0))
+            .wgpu()
+            .build_eframe(|cc| App::new(cc, Session::demo()));
+        {
+            let app = h.state_mut();
+            app.tab = Tab::Graphics;
+            app.graphs = vec![
+                GraphPanel {
+                    id: 0,
+                    signals: vec!["EngineSpeed".into(), "CoolantTemp".into()],
+                },
+                GraphPanel {
+                    id: 1,
+                    signals: vec!["VehicleSpeed".into()],
+                },
+            ];
+            app.next_graph_id = 2;
+        }
+        h.run();
+        let _ = h.try_snapshot("03b_graphics_populated");
     }
 }
