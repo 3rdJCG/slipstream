@@ -61,7 +61,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 
 ### P1 — 解析 UI
 - [x] DBC ロード（`can-dbc` crate）→ `DbcDatabase`
-- [x] ベクトル化シグナルデコード（列単位: start bit / 長さ / エンディアン / 符号付き / scale+offset）。マルチプレクスは未対応（下記 Backlog）
+- [x] ベクトル化シグナルデコード（列単位: start bit / 長さ / エンディアン / 符号付き / scale+offset）。マルチプレクス対応済み（マルチプレクサ選択子を尊重。下記 Backlog 参照）
 - [x] デコード済みシグナルの時系列プロット（デモ系列を実データに置き換え。demo は encode→decode を実走）
 - [x] 検索 / フィルタ（id / 時間範囲 / channel による。core: `FrameFilter` + `filtered_rows`/`filtered_count`。signal 値での絞り込みは下記「述語エンジン」で対応）
 - [x] 統計（件数、min/max、平均、周期/周波数）
@@ -148,7 +148,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 ### Backlog / 後で見つかったもの
 - [ ] モデルでは channel 列が `u8` だが `blf_asc::Message.channel` は `u16` — 255 を超える channel が問題になる場合は見直す
 - [ ] エラーフレーム / 方向（Rx/Tx）を列として保持する（現状は破棄している）
-- [ ] マルチプレクスシグナルのデコード（マルチプレクサ選択子を尊重する。現状は無条件デコード）
+- [x] マルチプレクスシグナルのデコード（マルチプレクサ選択子を尊重する）— `SignalDef.mux: MuxRole{Plain/Multiplexor/Multiplexed(sel)}`（`map_signal` で設定、`MultiplexorAndMultiplexedSignal` は `Multiplexor` に単純化）。`signal_series` は Multiplexed シグナルを、同一メッセージの Multiplexor 値 == sel のフレームでのみデコード（Multiplexor 不在のメッセージは無条件デコードにフォールバック）
 - [ ] DBC の文字コード（現状 UTF-8 前提。実ファイルは CP1252 等もあり得る → `can_dbc::encodings` で対応可）
 - [ ] フィルタが毎回 O(n) 全スキャン（`matching_indices`）— マルチGB + 対話フィルタ向けにインデックス化 / フィルタ結果キャッシュ
 - [x] 拡張 ID（29bit）と標準 ID の区別フラグ（現状 `can_id: u32` のみで判別不可）

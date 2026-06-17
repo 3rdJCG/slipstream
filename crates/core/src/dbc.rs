@@ -5,14 +5,33 @@
 //! bit-extraction here handles Intel/Motorola layout, signed-ness, and the
 //! linear `raw * scale + offset` conversion.
 //!
-//! TODO(P1): multiplexed signals are decoded unconditionally for now; honor the
-//! multiplexor selector so multiplexed signals are only decoded on matching
-//! frames.
+//! Multiplexed signals honor the multiplexor selector: a signal tagged
+//! [`MuxRole::Multiplexed(sel)`] is only decoded on frames where its message's
+//! multiplexor signal reads `sel` (see `query::signal_series`).
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::{ByteOrder, SignalMeta};
 use crate::{Error, Result};
+
+/// A signal's role in a message's multiplexing scheme.
+///
+/// DBC's `MultiplexorAndMultiplexedSignal` (a signal that is *both* multiplexed
+/// and itself a sub-multiplexor) is simplified to [`MuxRole::Multiplexor`]: we
+/// treat it as the selector and do not model nested multiplexing. Plain
+/// messages have no multiplexor and all their signals are [`MuxRole::Plain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MuxRole {
+    /// An ordinary, always-present signal.
+    Plain,
+    /// The multiplexor switch — its value selects which multiplexed signals are
+    /// present in a given frame.
+    Multiplexor,
+    /// Present only when the message's multiplexor reads this selector value.
+    Multiplexed(u64),
+}
 
 /// One signal's bit layout + linear conversion.
 #[derive(Debug, Clone)]
@@ -25,6 +44,8 @@ pub struct SignalDef {
     pub scale: f64,
     pub offset: f64,
     pub unit: String,
+    /// Role in the owning message's multiplexing scheme.
+    pub mux: MuxRole,
 }
 
 /// Parsed DBC: messages keyed by frame id.
@@ -105,14 +126,23 @@ impl DbcDatabase {
             .collect()
     }
 
-    /// Find a signal by name, returning it with its owning message id.
-    pub fn find_signal(&self, name: &str) -> Option<(u32, &SignalDef)> {
+    /// Find a signal by name, returning it together with its owning message.
+    /// The message is needed so the decode path can locate the message's
+    /// multiplexor signal (see [`DbcMessage::multiplexor`]).
+    pub fn find_signal(&self, name: &str) -> Option<(&DbcMessage, &SignalDef)> {
         self.messages.iter().find_map(|m| {
             m.signals
                 .iter()
                 .find(|s| s.name == name)
-                .map(|s| (m.can_id, s))
+                .map(|s| (m, s))
         })
+    }
+}
+
+impl DbcMessage {
+    /// The message's multiplexor (selector) signal, if it has one.
+    pub fn multiplexor(&self) -> Option<&SignalDef> {
+        self.signals.iter().find(|s| s.mux == MuxRole::Multiplexor)
     }
 }
 
@@ -129,6 +159,14 @@ fn map_signal(s: &can_dbc::Signal) -> SignalDef {
         scale: s.factor,
         offset: s.offset,
         unit: s.unit.clone(),
+        mux: match s.multiplexer_indicator {
+            can_dbc::MultiplexIndicator::Plain => MuxRole::Plain,
+            can_dbc::MultiplexIndicator::Multiplexor => MuxRole::Multiplexor,
+            can_dbc::MultiplexIndicator::MultiplexedSignal(sel) => MuxRole::Multiplexed(sel),
+            // Simplify a combined multiplexor+multiplexed signal to the
+            // multiplexor role (we do not model nested multiplexing).
+            can_dbc::MultiplexIndicator::MultiplexorAndMultiplexedSignal(_) => MuxRole::Multiplexor,
+        },
     }
 }
 
@@ -213,6 +251,7 @@ mod tests {
             scale,
             offset,
             unit: "".into(),
+            mux: MuxRole::Plain,
         }
     }
 
@@ -256,9 +295,25 @@ mod tests {
         let db = DbcDatabase::parse(dbc).expect("parse");
         assert_eq!(db.messages.len(), 1);
         assert_eq!(db.messages[0].can_id, 256);
-        let (id, s) = db.find_signal("Rpm").expect("signal");
-        assert_eq!(id, 256);
+        let (m, s) = db.find_signal("Rpm").expect("signal");
+        assert_eq!(m.can_id, 256);
         assert_eq!(s.bit_len, 16);
         assert_eq!(s.scale, 0.25);
+        assert_eq!(s.mux, MuxRole::Plain);
+    }
+
+    #[test]
+    fn parse_multiplexed_dbc_assigns_roles() {
+        // A message with a multiplexor `Mux` (M) and two multiplexed signals
+        // `A` (m0) and `B` (m1).
+        let dbc = "VERSION \"\"\n\nBO_ 512 Muxed: 8 ECU\n SG_ Mux M : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n SG_ A m0 : 8|8@1+ (1,0) [0|255] \"\" Vector__XXX\n SG_ B m1 : 8|8@1+ (1,0) [0|255] \"\" Vector__XXX\n";
+        let db = DbcDatabase::parse(dbc).expect("parse");
+        let (m, mux) = db.find_signal("Mux").expect("Mux");
+        assert_eq!(mux.mux, MuxRole::Multiplexor);
+        assert_eq!(m.multiplexor().map(|s| s.name.as_str()), Some("Mux"));
+        let (_, a) = db.find_signal("A").expect("A");
+        assert_eq!(a.mux, MuxRole::Multiplexed(0));
+        let (_, b) = db.find_signal("B").expect("B");
+        assert_eq!(b.mux, MuxRole::Multiplexed(1));
     }
 }

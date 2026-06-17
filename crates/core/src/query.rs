@@ -984,9 +984,18 @@ impl Session {
     /// via the DBC. Gathers all frames for the signal's `can_id` and decodes
     /// each payload (the column-at-a-time decode path).
     pub(crate) fn signal_series(&self, name: &str) -> Result<Vec<(f64, f64)>> {
-        let (can_id, sig, channel) = self
+        use crate::dbc::MuxRole;
+        let (msg, sig, channel) = self
             .find_signal(name)
             .ok_or_else(|| Error::UnknownSignal(name.to_string()))?;
+        let can_id = msg.can_id;
+        // For a multiplexed signal, find the owning message's multiplexor so we
+        // only decode frames where it selects this signal. If the message has
+        // no multiplexor signal, fall back to unconditional decoding.
+        let mux_gate = match sig.mux {
+            MuxRole::Multiplexed(sel) => msg.multiplexor().map(|mux| (mux, sel)),
+            _ => None,
+        };
         let cols = self.store.columns();
         let mut out = Vec::new();
         for i in 0..cols.len() {
@@ -1000,7 +1009,15 @@ impl Session {
                 }
             }
             let dlc = cols.dlc[i] as usize;
-            if let Some(v) = crate::dbc::decode_signal(sig, &cols.data[i][..dlc]) {
+            let data = &cols.data[i][..dlc];
+            // Skip frames whose multiplexor does not select this signal.
+            if let Some((mux, sel)) = mux_gate {
+                match crate::dbc::decode_signal(mux, data) {
+                    Some(v) if v as u64 == sel => {}
+                    _ => continue,
+                }
+            }
+            if let Some(v) = crate::dbc::decode_signal(sig, data) {
                 out.push((cols.timestamp[i], v));
             }
         }
@@ -1008,11 +1025,16 @@ impl Session {
     }
 
     /// Find a signal by name across all loaded DBCs (first match), returning its
-    /// frame id, definition, and the owning DBC's channel scope.
-    fn find_signal(&self, name: &str) -> Option<(u32, &crate::dbc::SignalDef, Option<u8>)> {
+    /// owning message, definition, and the owning DBC's channel scope. The
+    /// message is returned (not just its id) so the decode path can locate the
+    /// message's multiplexor for honoring multiplexed signals.
+    fn find_signal(
+        &self,
+        name: &str,
+    ) -> Option<(&crate::dbc::DbcMessage, &crate::dbc::SignalDef, Option<u8>)> {
         for d in &self.dbcs {
-            if let Some((can_id, sig)) = d.db.find_signal(name) {
-                return Some((can_id, sig, d.channel));
+            if let Some((msg, sig)) = d.db.find_signal(name) {
+                return Some((msg, sig, d.channel));
             }
         }
         None
@@ -1118,7 +1140,7 @@ fn frames_channels(frames: &FrameColumns) -> Vec<u8> {
 }
 
 fn demo_dbc() -> DbcDatabase {
-    use crate::dbc::{DbcMessage, SignalDef};
+    use crate::dbc::{DbcMessage, MuxRole, SignalDef};
     use crate::model::ByteOrder;
     let sig = |name: &str, start_bit: u16, bit_len: u16, scale: f64, offset: f64, unit: &str| {
         SignalDef {
@@ -1130,6 +1152,7 @@ fn demo_dbc() -> DbcDatabase {
             scale,
             offset,
             unit: unit.to_string(),
+            mux: MuxRole::Plain,
         }
     };
     DbcDatabase {
@@ -1713,5 +1736,53 @@ mod tests {
         assert_eq!(reopened.list_dbcs().len(), 0);
 
         let _ = std::fs::remove_file(&proj);
+    }
+
+    #[test]
+    fn multiplexed_signal_honors_selector() {
+        // Message 0x300 carries a multiplexor `Mux` (byte0) plus two multiplexed
+        // signals `A` (m0) and `B` (m1), both in byte1. Frames alternate byte0
+        // 0/1, with the payload value rising each frame, so we can tell which
+        // frames a signal was decoded from.
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let log = dir.join(format!("slipstream_mux_{pid}.asc"));
+        let dbc = dir.join(format!("slipstream_mux_{pid}.dbc"));
+        std::fs::write(
+            &dbc,
+            "VERSION \"\"\n\nBO_ 768 Muxed: 8 ECU\n SG_ Mux M : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n SG_ A m0 : 8|8@1+ (1,0) [0|255] \"\" Vector__XXX\n SG_ B m1 : 8|8@1+ (1,0) [0|255] \"\" Vector__XXX\n",
+        )
+        .unwrap();
+        // ASC classic line: `<ts> <ch> <idhex> Rx d <dlc> <bytes...>` (hex bytes).
+        // 6 frames on id 0x300 (=768), byte0 = mux selector, byte1 = payload.
+        // mux=0 frames carry payload 10,12,14; mux=1 frames carry 11,13,15.
+        let mut text = String::new();
+        let payloads = [(0u8, 10u8), (1, 11), (0, 12), (1, 13), (0, 14), (1, 15)];
+        for (i, (mux, val)) in payloads.iter().enumerate() {
+            let t = i as f64 * 0.01;
+            text.push_str(&format!("{t} 1 300 Rx d 2 {:02X} {:02X}\n", mux, val));
+        }
+        std::fs::write(&log, &text).unwrap();
+
+        let mut s = Session::open(&log).unwrap();
+        s.add_dbc(&dbc, None).unwrap();
+
+        // A decodes only on mux==0 frames: payloads 10, 12, 14.
+        let a = s.signal_series("A").expect("A series");
+        let a_vals: Vec<f64> = a.iter().map(|&(_, v)| v).collect();
+        assert_eq!(a_vals, vec![10.0, 12.0, 14.0], "A only from mux==0 frames");
+
+        // B decodes only on mux==1 frames: payloads 11, 13, 15.
+        let b = s.signal_series("B").expect("B series");
+        let b_vals: Vec<f64> = b.iter().map(|&(_, v)| v).collect();
+        assert_eq!(b_vals, vec![11.0, 13.0, 15.0], "B only from mux==1 frames");
+
+        // The multiplexor itself decodes on every frame (alternating 0/1).
+        let mux = s.signal_series("Mux").expect("Mux series");
+        let mux_vals: Vec<f64> = mux.iter().map(|&(_, v)| v).collect();
+        assert_eq!(mux_vals, vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&dbc);
     }
 }
