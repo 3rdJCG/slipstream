@@ -131,7 +131,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [x] **Graph** タブ — デコード済みシグナルのプロット（カーソル読み出し / 範囲ズーム再間引き / 正規化トグル。真のマルチ Y 軸は今後）
 - [x] **Diff** タブ — 2つのログを CAN id 単位で比較（`Session::diff_logs`、存在差分・件数・Δ件数・平均周期のテーブル表示。OnlyA/OnlyB を色分け）
 - [ ] タブ間で選択状態（時間範囲・対象 ID/シグナル）を共有・連動させる
-- [ ] 各タブの空状態（log 未ロード / DBC 未設定）の表示
+- [x] 各タブの空状態（log 未ロード / DBC 未設定）の表示
 
 ### P1 — プロジェクト / 永続化
 - [x] プロジェクト（ワークスペース）の保存・再オープン：log パス + 複数 DBC + channel マッピング
@@ -149,7 +149,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [ ] モデルでは channel 列が `u8` だが `blf_asc::Message.channel` は `u16` — 255 を超える channel が問題になる場合は見直す
 - [ ] エラーフレーム / 方向（Rx/Tx）を列として保持する（現状は破棄している）
 - [x] マルチプレクスシグナルのデコード（マルチプレクサ選択子を尊重する）— `SignalDef.mux: MuxRole{Plain/Multiplexor/Multiplexed(sel)}`（`map_signal` で設定、`MultiplexorAndMultiplexedSignal` は `Multiplexor` に単純化）。`signal_series` は Multiplexed シグナルを、同一メッセージの Multiplexor 値 == sel のフレームでのみデコード（Multiplexor 不在のメッセージは無条件デコードにフォールバック）
-- [ ] DBC の文字コード（現状 UTF-8 前提。実ファイルは CP1252 等もあり得る → `can_dbc::encodings` で対応可）
+- [x] DBC の文字コード（現状 UTF-8 前提。実ファイルは CP1252 等もあり得る → `can_dbc::encodings` で対応可）
 - [ ] フィルタが毎回 O(n) 全スキャン（`matching_indices`）— マルチGB + 対話フィルタ向けにインデックス化 / フィルタ結果キャッシュ
 - [x] 拡張 ID（29bit）と標準 ID の区別フラグ（現状 `can_id: u32` のみで判別不可）
 

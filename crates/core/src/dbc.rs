@@ -65,9 +65,19 @@ pub struct DbcMessage {
 }
 
 impl DbcDatabase {
-    /// Load and parse a `.dbc` file (UTF-8).
+    /// Load and parse a `.dbc` file.
+    ///
+    /// Reads raw bytes and decodes tolerantly: UTF-8 first, falling back to
+    /// Windows-1252 (CP1252) when the bytes are not valid UTF-8. Real-world DBC
+    /// files are frequently authored in CP1252 (e.g. `°`, `é` in signal units).
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let bytes = std::fs::read(path)?;
+        let text: std::borrow::Cow<str> = match std::str::from_utf8(&bytes) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => can_dbc::decode_cp1252(&bytes).ok_or_else(|| {
+                Error::Parse("DBC file is neither valid UTF-8 nor CP1252".into())
+            })?,
+        };
         Self::parse(&text)
     }
 
@@ -300,6 +310,33 @@ mod tests {
         assert_eq!(s.bit_len, 16);
         assert_eq!(s.scale, 0.25);
         assert_eq!(s.mux, MuxRole::Plain);
+    }
+
+    #[test]
+    fn load_cp1252_dbc_falls_back() {
+        // Build a valid DBC whose signal unit contains a CP1252-only byte
+        // (0xB0 = '°' in CP1252, which is *not* valid UTF-8 on its own).
+        let mut bytes: Vec<u8> =
+            b"VERSION \"\"\n\nBO_ 256 EngineData: 8 ECU\n SG_ Temp : 0|16@1+ (0.1,0) [0|6553] \""
+                .to_vec();
+        bytes.push(0xB0); // '°' in CP1252
+        bytes.push(b'C');
+        bytes.extend_from_slice(b"\" Vector__XXX\n");
+
+        // Sanity: these bytes are not valid UTF-8, so load() must fall back.
+        assert!(std::str::from_utf8(&bytes).is_err());
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("slipstream_cp1252_test_{}.dbc", std::process::id()));
+        std::fs::write(&path, &bytes).expect("write temp dbc");
+
+        let result = DbcDatabase::load(&path);
+        let _ = std::fs::remove_file(&path); // clean up regardless of outcome
+
+        let db = result.expect("load should succeed via CP1252 fallback");
+        let (_, s) = db.find_signal("Temp").expect("signal Temp");
+        // The CP1252 byte 0xB0 decodes to '°', so the unit is "°C".
+        assert_eq!(s.unit, "\u{00B0}C");
     }
 
     #[test]

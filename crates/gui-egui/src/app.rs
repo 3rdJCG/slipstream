@@ -195,6 +195,13 @@ fn config_tab(
         ui.heading("Config");
         ui.separator();
 
+        // Empty state: when nothing is loaded (no logs and no DBCs), nudge the
+        // user toward the first actions. Demo runs have logs/DBCs so this stays hidden.
+        if session.list_logs().is_empty() && session.list_dbcs().is_empty() {
+            ui.label("Open a log and a DBC to begin, or Open project…");
+            ui.separator();
+        }
+
         ui.horizontal(|ui| {
             if ui.button("Open log…").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
@@ -409,6 +416,20 @@ fn analysis_tab(
     bus_window: &mut f64,
     export_status: &mut Option<String>,
 ) {
+    // Empty state: with no frames loaded, skip rendering the (virtualized) frame
+    // and message tables entirely and show a single prominent hint. The tab stays
+    // usable — switching tabs and loading a log in Config still works.
+    if session.frame_count() == 0 {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Frames");
+            ui.separator();
+            ui.centered_and_justified(|ui| {
+                ui.label("No frames. Load a BLF/ASC log in the Config tab.");
+            });
+        });
+        return;
+    }
+
     // Build a FrameFilter from the (lenient) text inputs. Unparseable fields are
     // simply treated as "no constraint", so a default filter matches all rows.
     let mut filter = FrameFilter::default();
@@ -1005,6 +1026,14 @@ fn graph_tab(
 
     // --- Plot --------------------------------------------------------------
     egui::CentralPanel::default().show(ctx, |ui| {
+        // Empty state: no decodable signals means no DBC is loaded (or it decodes
+        // nothing), so point at Config rather than the generic select-a-signal hint.
+        if signals.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No decodable signals. Load a DBC in the Config tab.");
+            });
+            return;
+        }
         if selected.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label("Select one or more signals on the left to plot.");
