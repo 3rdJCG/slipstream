@@ -15,6 +15,7 @@ pub fn parse(path: &Path) -> Result<FrameColumns> {
             msg.timestamp,
             msg.channel as u8,
             msg.arbitration_id.0,
+            msg.is_extended_id,
             msg.is_fd,
             msg.data.as_slice(),
         );

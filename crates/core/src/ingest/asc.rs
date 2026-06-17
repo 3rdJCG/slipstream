@@ -122,7 +122,7 @@ fn parse_classic(toks: &[&str], ts: f64, base: Base, cols: &mut FrameColumns) {
     if id_tok.eq_ignore_ascii_case("ErrorFrame") {
         return;
     }
-    let (can_id, _extended) = match parse_id(id_tok, base) {
+    let (can_id, extended) = match parse_id(id_tok, base) {
         Some(v) => v,
         None => return,
     };
@@ -141,7 +141,7 @@ fn parse_classic(toks: &[&str], ts: f64, base: Base, cols: &mut FrameColumns) {
 
     if kind.eq_ignore_ascii_case("r") {
         // Remote frame: no payload (a dlc may follow but we ignore the data).
-        cols.push(ts, channel as u8, can_id, false, &[]);
+        cols.push(ts, channel as u8, can_id, extended, false, &[]);
         return;
     }
     if !kind.eq_ignore_ascii_case("d") {
@@ -155,7 +155,7 @@ fn parse_classic(toks: &[&str], ts: f64, base: Base, cols: &mut FrameColumns) {
     };
     let want = dlc.min(8);
     let data = collect_bytes(&toks[6..], want, base);
-    cols.push(ts, channel as u8, can_id, false, &data);
+    cols.push(ts, channel as u8, can_id, extended, false, &data);
 }
 
 /// CAN-FD line:
@@ -180,7 +180,7 @@ fn parse_canfd(toks: &[&str], ts: f64, base: Base, cols: &mut FrameColumns) {
     if id_tok.eq_ignore_ascii_case("ErrorFrame") {
         return;
     }
-    let (can_id, _extended) = match parse_id(id_tok, base) {
+    let (can_id, extended) = match parse_id(id_tok, base) {
         Some(v) => v,
         None => return,
     };
@@ -214,7 +214,7 @@ fn parse_canfd(toks: &[&str], ts: f64, base: Base, cols: &mut FrameColumns) {
 
     let want = datalen.min(64);
     let data = collect_bytes(&toks[i.min(toks.len())..], want, base);
-    cols.push(ts, channel as u8, can_id, true, &data);
+    cols.push(ts, channel as u8, can_id, extended, true, &data);
 }
 
 /// Parse an arbitration id token, honoring a trailing `x` (extended → masked to
@@ -321,6 +321,29 @@ End TriggerBlock
         assert!(cols.is_fd[4]);
         assert_eq!(cols.dlc[4], 0);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extended_id_flag_set_per_frame() {
+        // An extended (29-bit, trailing 'x') line and a standard line. Goes
+        // through the full ingest path so `is_extended` is exercised end to end.
+        let body = "\
+date x
+base hex  timestamps absolute
+   0.000000 Start of measurement
+   0.000000 1 18EBFF00x Rx d 1 11
+   0.001000 1 7FF       Rx d 1 22
+";
+        let path = write_tmp("extflag", body);
+        let cols = crate::ingest::parse(&path).expect("parse");
+        assert_eq!(cols.len(), 2);
+        // Extended frame: masked 29-bit id, flag true.
+        assert_eq!(cols.can_id[0], 0x18EBFF00);
+        assert!(cols.is_extended[0], "extended id must set is_extended=true");
+        // Standard frame: flag false.
+        assert_eq!(cols.can_id[1], 0x7FF);
+        assert!(!cols.is_extended[1], "standard id must set is_extended=false");
         let _ = std::fs::remove_file(&path);
     }
 

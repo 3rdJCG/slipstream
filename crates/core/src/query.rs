@@ -151,6 +151,17 @@ pub struct MessageStats {
     pub mean_dt: Option<f64>,
 }
 
+/// Estimated bus load for one channel over one time window. `load_pct` is the
+/// share of the channel's theoretical capacity consumed by the frames whose
+/// timestamp falls in `[t_start, t_end)`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BusLoadPoint {
+    pub channel: u8,
+    pub t_start: f64,
+    pub t_end: f64,
+    pub load_pct: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Session — owns loaded state, answers queries
 // ---------------------------------------------------------------------------
@@ -223,14 +234,14 @@ impl Session {
             p100[0..2].copy_from_slice(&((rpm / 0.25) as u16).to_le_bytes());
             let temp = 60.0 + 20.0 * (t * 0.05).sin();
             p100[2] = (temp + 40.0) as u8;
-            frames.push(t, 1, 0x100, false, &p100);
+            frames.push(t, 1, 0x100, false, false, &p100);
 
             // 0x200 VehicleState: VehicleSpeed (u16 @0, *0.01), Gear (nibble @byte2).
             let mut p200 = [0u8; 8];
             let kph = 60.0 + 55.0 * (t * 0.3 + 1.0).sin();
             p200[0..2].copy_from_slice(&((kph / 0.01) as u16).to_le_bytes());
             p200[2] = ((i / 500) % 6) as u8;
-            frames.push(t, 1, 0x200, false, &p200);
+            frames.push(t, 1, 0x200, false, false, &p200);
         }
 
         let channels = frames_channels(&frames);
@@ -632,6 +643,54 @@ impl Session {
         out
     }
 
+    /// Per-channel, windowed bus-load estimate.
+    ///
+    /// The log duration is sliced into fixed windows `[k*window_s,
+    /// (k+1)*window_s)`. For each window and channel, the on-wire bit count of
+    /// every frame in that window is summed, then divided by the window's
+    /// theoretical capacity `bitrate_bps * window_s` to yield a percentage
+    /// (capped at 100). Windows with no frames for a channel are skipped.
+    /// Points are ordered by `(channel, t_start)`.
+    ///
+    /// On-wire bit counts are *approximate*: bit-stuffing is not modeled, so the
+    /// real load is somewhat higher. CAN-FD frames are estimated at the nominal
+    /// bitrate — real FD has a separate, faster data-phase bitrate, so FD load
+    /// is overstated here (future work).
+    pub fn bus_load(&self, bitrate_bps: u32, window_s: f64) -> Vec<BusLoadPoint> {
+        use std::collections::BTreeMap;
+        if window_s <= 0.0 || bitrate_bps == 0 {
+            return Vec::new();
+        }
+        let cols = self.store.columns();
+        // (channel, window index) -> summed on-wire bits.
+        let mut acc: BTreeMap<(u8, u64), u64> = BTreeMap::new();
+        for i in 0..cols.len() {
+            let k = (cols.timestamp[i] / window_s).floor().max(0.0) as u64;
+            let bits = frame_on_wire_bits(cols.is_extended[i], cols.is_fd[i], cols.dlc[i]);
+            *acc.entry((cols.channel[i], k)).or_insert(0) += bits;
+        }
+        let capacity = bitrate_bps as f64 * window_s;
+        let mut out: Vec<BusLoadPoint> = acc
+            .into_iter()
+            .map(|((channel, k), bits)| {
+                let load = bits as f64 / capacity * 100.0;
+                BusLoadPoint {
+                    channel,
+                    t_start: k as f64 * window_s,
+                    t_end: (k + 1) as f64 * window_s,
+                    load_pct: load.min(100.0),
+                }
+            })
+            .collect();
+        // BTreeMap already yields (channel, window) order; make it explicit.
+        out.sort_by(|a, b| {
+            a.channel
+                .cmp(&b.channel)
+                .then(a.t_start.partial_cmp(&b.t_start).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        out
+    }
+
     /// Build default health rules from the DBC's `GenMsgCycleTime` attributes
     /// (one rule per message that declares a cycle time), with a shared
     /// `tolerance`. Manual rules can be added on top.
@@ -826,6 +885,29 @@ fn min_max_decimate(points: &[(f64, f64)], t0: f64, t1: f64, px_width: u32) -> V
         .flatten()
         .map(|(t, v_min, v_max)| PlotBin { t, v_min, v_max })
         .collect()
+}
+
+/// Approximate on-wire bit count of a single CAN frame.
+///
+/// Bit-stuffing is **not** modeled (real frames are a little longer). For
+/// classic CAN the fixed overhead (SOF, arbitration, control, CRC, ACK, EOF) is
+/// 47 bits for standard ids and 67 for extended; plus `8 * dlc` data bits and 3
+/// inter-frame-space bits. CAN-FD is a rough estimate at the nominal bitrate
+/// (60/80 overhead) — real FD uses a separate, faster data-phase bitrate, which
+/// this does not account for (future work).
+fn frame_on_wire_bits(is_extended: bool, is_fd: bool, dlc: u8) -> u64 {
+    let overhead = if is_fd {
+        if is_extended {
+            80
+        } else {
+            60
+        }
+    } else if is_extended {
+        67
+    } else {
+        47
+    };
+    overhead + 8 * dlc as u64 + 3
 }
 
 /// Distinct channels present in a frame set (sorted ascending).
@@ -1185,6 +1267,52 @@ mod tests {
         let signals = s.available_signals();
         assert!(!signals.is_empty());
         assert!(signals.iter().any(|m| m.name == "Rpm"));
+    }
+
+    #[test]
+    fn bus_load_demo_is_in_range_on_channel_1() {
+        let s = Session::demo();
+        // 1 Mbit/s, 1-second windows over the 60 s demo. Two ids (0x100, 0x200)
+        // on channel 1, each ~12 ms cadence with 8-byte classic-CAN payloads.
+        let points = s.bus_load(1_000_000, 1.0);
+        assert!(!points.is_empty());
+        // Every point is on channel 1 and within (0, 100].
+        assert!(points.iter().all(|p| p.channel == 1));
+        assert!(
+            points.iter().all(|p| p.load_pct > 0.0 && p.load_pct <= 100.0),
+            "loads: {:?}",
+            points.iter().map(|p| p.load_pct).collect::<Vec<_>>()
+        );
+        // Windows are ordered by (channel, t_start).
+        assert!(points.windows(2).all(|w| {
+            w[0].channel < w[1].channel
+                || (w[0].channel == w[1].channel && w[0].t_start <= w[1].t_start)
+        }));
+        // A representative load: ~167 frames/window * 111 bits / 1e6 ≈ 1.85%.
+        let mid = &points[points.len() / 2];
+        assert!(mid.load_pct > 0.5 && mid.load_pct < 10.0, "load {}", mid.load_pct);
+    }
+
+    #[test]
+    fn bus_load_high_bitrate_is_tiny() {
+        let s = Session::demo();
+        let slow = s.bus_load(125_000, 1.0);
+        let fast = s.bus_load(10_000_000, 1.0);
+        let avg = |pts: &[BusLoadPoint]| {
+            pts.iter().map(|p| p.load_pct).sum::<f64>() / pts.len() as f64
+        };
+        let slow_avg = avg(&slow);
+        let fast_avg = avg(&fast);
+        // A much higher bitrate gives a much smaller load percentage.
+        assert!(fast_avg < slow_avg, "fast {fast_avg} slow {slow_avg}");
+        assert!(fast_avg < 1.0, "fast avg {fast_avg}");
+    }
+
+    #[test]
+    fn bus_load_zero_window_is_empty() {
+        let s = Session::demo();
+        assert!(s.bus_load(500_000, 0.0).is_empty());
+        assert!(s.bus_load(0, 1.0).is_empty());
     }
 
     #[test]

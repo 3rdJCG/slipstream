@@ -42,6 +42,7 @@ impl FrameStore {
             timestamp: self.frames.timestamp[i],
             channel: self.frames.channel[i],
             can_id: self.frames.can_id[i],
+            is_extended: self.frames.is_extended[i],
             is_fd: self.frames.is_fd[i],
             dlc,
             data,

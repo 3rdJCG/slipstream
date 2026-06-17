@@ -36,6 +36,10 @@ pub struct App {
     health_tolerance: f64,
     /// Channels selected in the Analysis-tab filter; empty = all channels.
     channel_filter: BTreeSet<u8>,
+    /// Bus-load nominal bitrate in bits/s (Analysis tab).
+    bus_bitrate: u32,
+    /// Bus-load aggregation window in seconds (Analysis tab).
+    bus_window: f64,
     // --- Config tab state --------------------------------------------------
     /// Last load error (log or DBC), shown in the Config tab; `None` = no error.
     config_error: Option<String>,
@@ -60,6 +64,8 @@ impl App {
             filter_t_end: String::new(),
             health_tolerance: 0.3,
             channel_filter: BTreeSet::new(),
+            bus_bitrate: 500_000,
+            bus_window: 1.0,
             config_error: None,
             export_status: None,
         }
@@ -81,6 +87,8 @@ impl eframe::App for App {
             filter_t_end,
             health_tolerance,
             channel_filter,
+            bus_bitrate,
+            bus_window,
             config_error,
             export_status,
         } = self;
@@ -104,6 +112,8 @@ impl eframe::App for App {
                 filter_t_end,
                 health_tolerance,
                 channel_filter,
+                bus_bitrate,
+                bus_window,
                 export_status,
             ),
             Tab::Graph => graph_tab(
@@ -308,6 +318,8 @@ fn analysis_tab(
     filter_t_end: &mut String,
     health_tolerance: &mut f64,
     channel_filter: &mut BTreeSet<u8>,
+    bus_bitrate: &mut u32,
+    bus_window: &mut f64,
     export_status: &mut Option<String>,
 ) {
     // Build a FrameFilter from the (lenient) text inputs. Unparseable fields are
@@ -457,6 +469,11 @@ fn analysis_tab(
         // the frame table is virtualized and fills remaining height, so it must
         // be the last widget in the panel or it overlaps what follows.
         health_section(ui, session, health_tolerance);
+        ui.separator();
+
+        // Bus load is also bounded content; keep it BEFORE the frame table so the
+        // virtualized table stays last and doesn't overlap it.
+        bus_load_section(ui, session, bus_bitrate, bus_window);
         ui.separator();
 
         TableBuilder::new(ui)
@@ -661,6 +678,93 @@ fn health_section(ui: &mut egui::Ui, session: &Session, health_tolerance: &mut f
                         });
                         row.col(|ui| {
                             ui.monospace(format!("{:.6}", v.expected_dt));
+                        });
+                    });
+                });
+        });
+}
+
+/// Maximum number of bus-load rows the table will display, to keep the
+/// per-frame rebuild cheap even when a log spans very many windows/channels.
+const BUS_LOAD_ROW_LIMIT: usize = 500;
+
+/// Bus-load section of the Analysis tab (collapsing). Thin view: it reads the
+/// nominal bitrate and window from UI state and calls [`Session::bus_load`],
+/// showing one row per (channel, window) with its on-wire load percentage.
+fn bus_load_section(
+    ui: &mut egui::Ui,
+    session: &Session,
+    bus_bitrate: &mut u32,
+    bus_window: &mut f64,
+) {
+    egui::CollapsingHeader::new("Bus load")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Bitrate (bps):");
+                ui.add(
+                    egui::DragValue::new(bus_bitrate)
+                        .speed(1000.0)
+                        .range(1..=u32::MAX),
+                );
+                ui.separator();
+                ui.label("Window (s):");
+                ui.add(
+                    egui::DragValue::new(bus_window)
+                        .speed(0.1)
+                        .range(0.001..=f64::MAX),
+                );
+            });
+
+            let points = session.bus_load(*bus_bitrate, *bus_window);
+            if points.is_empty() {
+                ui.label("No frames to compute bus load (load a log in Config).");
+                return;
+            }
+
+            let shown = points.len().min(BUS_LOAD_ROW_LIMIT);
+            if points.len() > BUS_LOAD_ROW_LIMIT {
+                ui.label(format!(
+                    "showing first {shown} of {} windows (truncated)",
+                    points.len()
+                ));
+            } else {
+                ui.label(format!("{} windows", points.len()));
+            }
+
+            TableBuilder::new(ui)
+                .id_salt("bus_load_table")
+                .striped(true)
+                .resizable(true)
+                // Bounded + shrink-to-content so this virtualized table sits
+                // inside the collapsing section instead of trying to fill it.
+                .auto_shrink([false, true])
+                .max_scroll_height(180.0)
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::auto())
+                .column(Column::remainder())
+                .header(20.0, |mut header| {
+                    for h in ["channel", "t_start", "t_end", "load %"] {
+                        header.col(|ui| {
+                            ui.strong(h);
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(18.0, shown, |mut row| {
+                        let p = &points[row.index()];
+                        row.col(|ui| {
+                            ui.monospace(p.channel.to_string());
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("{:.4}", p.t_start));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("{:.4}", p.t_end));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("{:.2}", p.load_pct));
                         });
                     });
                 });

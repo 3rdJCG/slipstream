@@ -66,7 +66,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [x] 検索 / フィルタ（id / 時間範囲 / channel による。core: `FrameFilter` + `filtered_rows`/`filtered_count`。signal 値での絞り込みは下記「述語エンジン」で対応）
 - [x] 統計（件数、min/max、平均、周期/周波数）
 - [x] メッセージ単位の統計（ID ごとの件数・実測周期。DBC 無し健全性の周期推定に流用）
-- [ ] バス負荷率（bus load %。channel ごと、時間窓で算出）
+- [x] バス負荷率（bus load %。channel ごと、時間窓で算出）— gui(Analysis): 「Bus load」折りたたみセクション（bitrate/window の DragValue + channel/t_start/t_end/load% テーブル、500 行で打ち切り）
 - [x] エクスポート（フィルタ済み行 / デコード済みシグナル / 健全性レポートを出力。まず CSV、のち Parquet）— core: `Session::export_frames_csv`/`export_signal_csv`/`export_health_csv`（`export.rs`、`BufWriter<File>`、書き込み行数を返す）。Parquet は今後
 - [ ] ログ比較 / diff（2つのログを並べて表示。回帰/異常ビュー）
 - [x] CLI のみではなくファイルを開くダイアログ（`rfd`）
@@ -149,7 +149,7 @@ cargo run -p slipstream-gui-egui -- file.blf  # 実際のログを開く
 - [ ] マルチプレクスシグナルのデコード（マルチプレクサ選択子を尊重する。現状は無条件デコード）
 - [ ] DBC の文字コード（現状 UTF-8 前提。実ファイルは CP1252 等もあり得る → `can_dbc::encodings` で対応可）
 - [ ] フィルタが毎回 O(n) 全スキャン（`matching_indices`）— マルチGB + 対話フィルタ向けにインデックス化 / フィルタ結果キャッシュ
-- [ ] 拡張 ID（29bit）と標準 ID の区別フラグ（現状 `can_id: u32` のみで判別不可）
+- [x] 拡張 ID（29bit）と標準 ID の区別フラグ（現状 `can_id: u32` のみで判別不可）
 
 ## メモ / 決定事項（Notes / decisions）
 - `blf_asc` はシングルスレッドのイテレータ（コンテナを逐次 inflate）。正しく動作し、
